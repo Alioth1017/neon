@@ -1,16 +1,18 @@
+from __future__ import annotations
+
 import os
 from contextlib import closing
 from pathlib import Path
 
 import psycopg2
 import pytest
+from fixtures.common_types import TenantId, TimelineId
 from fixtures.neon_fixtures import (
     NeonEnv,
     NeonEnvBuilder,
     PgProtocol,
 )
 from fixtures.pageserver.http import PageserverApiException, PageserverHttpClient
-from fixtures.types import TenantId, TimelineId
 
 
 def assert_client_authorized(env: NeonEnv, http_client: PageserverHttpClient):
@@ -76,7 +78,7 @@ def test_compute_auth_to_pageserver(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
 
     branch = "test_compute_auth_to_pageserver"
-    env.neon_cli.create_branch(branch)
+    env.create_branch(branch)
     endpoint = env.endpoints.create_start(branch)
 
     with closing(endpoint.connect()) as conn:
@@ -105,7 +107,7 @@ def test_pageserver_multiple_keys(neon_env_builder: NeonEnvBuilder):
     # The neon_local tool generates one key pair at a hardcoded path by default.
     # As a preparation for our test, move the public key of the key pair into a
     # directory at the same location as the hardcoded path by:
-    # 1. moving the the file at `configured_pub_key_path` to a temporary location
+    # 1. moving the file at `configured_pub_key_path` to a temporary location
     # 2. creating a new directory at `configured_pub_key_path`
     # 3. moving the file from the temporary location into the newly created directory
     configured_pub_key_path = Path(env.repo_dir) / "auth_public_key.pem"
@@ -186,7 +188,7 @@ def test_auth_failures(neon_env_builder: NeonEnvBuilder, auth_enabled: bool):
     env = neon_env_builder.init_start()
 
     branch = f"test_auth_failures_auth_enabled_{auth_enabled}"
-    timeline_id = env.neon_cli.create_branch(branch)
+    timeline_id = env.create_branch(branch)
     env.endpoints.create_start(branch)
 
     tenant_token = env.auth_keys.generate_tenant_token(env.initial_tenant)
@@ -211,7 +213,7 @@ def test_auth_failures(neon_env_builder: NeonEnvBuilder, auth_enabled: bool):
     def check_pageserver(expect_success: bool, **conn_kwargs):
         check_connection(
             env.pageserver,
-            f"get_last_record_rlsn {env.initial_tenant} {timeline_id}",
+            f"pagestream_v2 {env.initial_tenant} {env.initial_timeline}",
             expect_success,
             **conn_kwargs,
         )
@@ -225,9 +227,7 @@ def test_auth_failures(neon_env_builder: NeonEnvBuilder, auth_enabled: bool):
 
         check_pageserver(True, password=pageserver_token)
 
-        env.pageserver.allowed_errors.append(
-            ".*SafekeeperData scope makes no sense for Pageserver.*"
-        )
+        env.pageserver.allowed_errors.append(".*JWT scope '.+' is ineligible for Pageserver auth.*")
         check_pageserver(False, password=safekeeper_token)
 
     def check_safekeeper(expect_success: bool, **conn_kwargs):

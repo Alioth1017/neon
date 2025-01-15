@@ -1,13 +1,21 @@
+from __future__ import annotations
+
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING
 
 import psycopg2
 import pytest
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnv, VanillaPostgres
+from psycopg2.errors import UndefinedObject
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers.request import Request
 from werkzeug.wrappers.response import Response
+
+if TYPE_CHECKING:
+    from typing import Any, Self
+
+    from fixtures.httpserver import ListenAddress
 
 
 def handle_db(dbs, roles, operation):
@@ -43,7 +51,7 @@ def handle_role(dbs, roles, operation):
 
 
 def ddl_forward_handler(
-    request: Request, dbs: Dict[str, str], roles: Dict[str, str], ddl: "DdlForwardingContext"
+    request: Request, dbs: dict[str, str], roles: dict[str, str], ddl: DdlForwardingContext
 ) -> Response:
     log.info(f"Received request with data {request.get_data(as_text=True)}")
     if ddl.fail:
@@ -52,14 +60,12 @@ def ddl_forward_handler(
     if request.json is None:
         log.info("Received invalid JSON")
         return Response(status=400)
-    json = request.json
+    json: dict[str, list[str]] = request.json
     # Handle roles first
-    if "roles" in json:
-        for operation in json["roles"]:
-            handle_role(dbs, roles, operation)
-    if "dbs" in json:
-        for operation in json["dbs"]:
-            handle_db(dbs, roles, operation)
+    for operation in json.get("roles", []):
+        handle_role(dbs, roles, operation)
+    for operation in json.get("dbs", []):
+        handle_db(dbs, roles, operation)
     return Response(status=200)
 
 
@@ -69,8 +75,8 @@ class DdlForwardingContext:
         self.pg = vanilla_pg
         self.host = host
         self.port = port
-        self.dbs: Dict[str, str] = {}
-        self.roles: Dict[str, str] = {}
+        self.dbs: dict[str, str] = {}
+        self.roles: dict[str, str] = {}
         self.fail = False
         endpoint = "/test/roles_and_databases"
         ddl_url = f"http://{host}:{port}{endpoint}"
@@ -85,19 +91,19 @@ class DdlForwardingContext:
             lambda request: ddl_forward_handler(request, self.dbs, self.roles, self)
         )
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         self.pg.start()
         return self
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ):
         self.pg.stop()
 
-    def send(self, query: str) -> List[Tuple[Any, ...]]:
+    def send(self, query: str) -> list[tuple[Any, ...]]:
         return self.pg.safe_psql(query)
 
     def wait(self, timeout=3):
@@ -106,7 +112,7 @@ class DdlForwardingContext:
     def failures(self, bool):
         self.fail = bool
 
-    def send_and_wait(self, query: str, timeout=3) -> List[Tuple[Any, ...]]:
+    def send_and_wait(self, query: str, timeout=3) -> list[tuple[Any, ...]]:
         res = self.send(query)
         self.wait(timeout=timeout)
         return res
@@ -114,7 +120,7 @@ class DdlForwardingContext:
 
 @pytest.fixture(scope="function")
 def ddl(
-    httpserver: HTTPServer, vanilla_pg: VanillaPostgres, httpserver_listen_address: tuple[str, int]
+    httpserver: HTTPServer, vanilla_pg: VanillaPostgres, httpserver_listen_address: ListenAddress
 ):
     (host, port) = httpserver_listen_address
     with DdlForwardingContext(httpserver, vanilla_pg, host, port) as ddl:
@@ -199,6 +205,23 @@ def test_ddl_forwarding(ddl: DdlForwardingContext):
     ddl.wait()
     assert ddl.roles == {}
 
+    cur.execute("CREATE ROLE bork WITH PASSWORD 'newyork'")
+    cur.execute("BEGIN")
+    cur.execute("SAVEPOINT point")
+    cur.execute("DROP ROLE bork")
+    cur.execute("COMMIT")
+    ddl.wait()
+    assert ddl.roles == {}
+
+    cur.execute("CREATE ROLE bork WITH PASSWORD 'oldyork'")
+    cur.execute("BEGIN")
+    cur.execute("SAVEPOINT point")
+    cur.execute("ALTER ROLE bork PASSWORD NULL")
+    cur.execute("COMMIT")
+    cur.execute("DROP ROLE bork")
+    ddl.wait()
+    assert ddl.roles == {}
+
     cur.execute("CREATE ROLE bork WITH PASSWORD 'dork'")
     cur.execute("CREATE DATABASE stork WITH OWNER=bork")
     cur.execute("ALTER ROLE bork RENAME TO cork")
@@ -248,8 +271,15 @@ def test_ddl_forwarding(ddl: DdlForwardingContext):
     # We don't have compute_ctl, so here, so create neon_superuser here manually
     cur.execute("CREATE ROLE neon_superuser NOLOGIN CREATEDB CREATEROLE")
 
-    with pytest.raises(psycopg2.InternalError):
-        cur.execute("ALTER ROLE neon_superuser LOGIN")
+    # Contrary to popular belief, being superman does not make you superuser
+    cur.execute("CREATE ROLE superman LOGIN NOSUPERUSER PASSWORD 'jungle_man'")
+
+    with ddl.pg.cursor(user="superman", password="jungle_man") as superman_cur:
+        # We allow real SUPERUSERs to ALTER neon_superuser
+        with pytest.raises(psycopg2.InternalError):
+            superman_cur.execute("ALTER ROLE neon_superuser LOGIN")
+
+    cur.execute("ALTER ROLE neon_superuser LOGIN")
 
     with pytest.raises(psycopg2.InternalError):
         cur.execute("CREATE DATABASE trololobus WITH OWNER neon_superuser")
@@ -283,13 +313,11 @@ def assert_db_connlimit(endpoint: Any, db_name: str, connlimit: int, msg: str):
 # Here we test the latter. The first one is tested in test_ddl_forwarding
 def test_ddl_forwarding_invalid_db(neon_simple_env: NeonEnv):
     env = neon_simple_env
-    env.neon_cli.create_branch("test_ddl_forwarding_invalid_db", "empty")
     endpoint = env.endpoints.create_start(
-        "test_ddl_forwarding_invalid_db",
+        "main",
         # Some non-existent url
         config_lines=["neon.console_url=http://localhost:9999/unknown/api/v0/roles_and_databases"],
     )
-    log.info("postgres is running on 'test_ddl_forwarding_invalid_db' branch")
 
     with endpoint.cursor() as cur:
         cur.execute("SET neon.forward_ddl = false")
@@ -325,3 +353,34 @@ def test_ddl_forwarding_invalid_db(neon_simple_env: NeonEnv):
         if not result:
             raise AssertionError("Could not count databases")
         assert result[0] == 0, "Database 'failure' still exists after restart"
+
+
+def test_ddl_forwarding_role_specs(neon_simple_env: NeonEnv):
+    """
+    Postgres has a concept of role specs:
+
+        ROLESPEC_CSTRING: ALTER ROLE xyz
+        ROLESPEC_CURRENT_USER: ALTER ROLE current_user
+        ROLESPEC_CURRENT_ROLE: ALTER ROLE current_role
+        ROLESPEC_SESSION_USER: ALTER ROLE session_user
+        ROLESPEC_PUBLIC: ALTER ROLE public
+
+    The extension is required to serialize these special role spec into
+    usernames for the purpose of DDL forwarding.
+    """
+    env = neon_simple_env
+
+    endpoint = env.endpoints.create_start("main")
+
+    with endpoint.cursor() as cur:
+        # ROLESPEC_CSTRING
+        cur.execute("ALTER ROLE cloud_admin WITH PASSWORD 'york'")
+        # ROLESPEC_CURRENT_USER
+        cur.execute("ALTER ROLE current_user WITH PASSWORD 'pork'")
+        # ROLESPEC_CURRENT_ROLE
+        cur.execute("ALTER ROLE current_role WITH PASSWORD 'cork'")
+        # ROLESPEC_SESSION_USER
+        cur.execute("ALTER ROLE session_user WITH PASSWORD 'bork'")
+        # ROLESPEC_PUBLIC
+        with pytest.raises(UndefinedObject):
+            cur.execute("ALTER ROLE public WITH PASSWORD 'dork'")

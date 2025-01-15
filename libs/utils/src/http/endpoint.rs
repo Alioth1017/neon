@@ -1,23 +1,29 @@
 use crate::auth::{AuthError, Claims, SwappableJwtAuth};
 use crate::http::error::{api_error_handler, route_error_handler, ApiError};
-use anyhow::Context;
-use hyper::header::{HeaderName, AUTHORIZATION};
+use crate::http::request::{get_query_param, parse_query_param};
+use crate::pprof;
+use ::pprof::protos::Message as _;
+use ::pprof::ProfilerGuardBuilder;
+use anyhow::{anyhow, Context};
+use bytes::{Bytes, BytesMut};
+use hyper::header::{HeaderName, AUTHORIZATION, CONTENT_DISPOSITION};
 use hyper::http::HeaderValue;
 use hyper::Method;
 use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use metrics::{register_int_counter, Encoder, IntCounter, TextEncoder};
 use once_cell::sync::Lazy;
+use regex::Regex;
 use routerify::ext::RequestExt;
 use routerify::{Middleware, RequestInfo, Router, RouterBuilder};
-use tracing::{self, debug, info, info_span, warn, Instrument};
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::ReaderStream;
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use std::future::Future;
-use std::str::FromStr;
-
-use bytes::{Bytes, BytesMut};
 use std::io::Write as _;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use std::str::FromStr;
+use std::time::Duration;
 
 static SERVE_METRICS_COUNT: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
@@ -52,17 +58,17 @@ struct RequestId(String);
 /// There could be other ways to implement similar functionality:
 ///
 /// * procmacros placed on top of all handler methods
-/// With all the drawbacks of procmacros, brings no difference implementation-wise,
-/// and little code reduction compared to the existing approach.
+///   With all the drawbacks of procmacros, brings no difference implementation-wise,
+///   and little code reduction compared to the existing approach.
 ///
 /// * Another `TraitExt` with e.g. the `get_with_span`, `post_with_span` methods to do similar logic,
-/// implemented for [`RouterBuilder`].
-/// Could be simpler, but we don't want to depend on [`routerify`] more, targeting to use other library later.
+///   implemented for [`RouterBuilder`].
+///   Could be simpler, but we don't want to depend on [`routerify`] more, targeting to use other library later.
 ///
 /// * In theory, a span guard could've been created in a pre-request middleware and placed into a global collection, to be dropped
-/// later, in a post-response middleware.
-/// Due to suspendable nature of the futures, would give contradictive results which is exactly the opposite of what `tracing-futures`
-/// tries to achive with its `.instrument` used in the current approach.
+///   later, in a post-response middleware.
+///   Due to suspendable nature of the futures, would give contradictive results which is exactly the opposite of what `tracing-futures`
+///   tries to achive with its `.instrument` used in the current approach.
 ///
 /// If needed, a declarative macro to substitute the |r| ... closure boilerplate could be introduced.
 pub async fn request_span<R, H>(request: Request<Body>, handler: H) -> R::Output
@@ -156,6 +162,10 @@ pub struct ChannelWriter {
     buffer: BytesMut,
     pub tx: mpsc::Sender<std::io::Result<Bytes>>,
     written: usize,
+    /// Time spent waiting for the channel to make progress. It is not the same as time to upload a
+    /// buffer because we cannot know anything about that, but this should allow us to understand
+    /// the actual time taken without the time spent `std::thread::park`ed.
+    wait_time: std::time::Duration,
 }
 
 impl ChannelWriter {
@@ -168,6 +178,7 @@ impl ChannelWriter {
             buffer: BytesMut::with_capacity(buf_len).split_off(buf_len / 2),
             tx,
             written: 0,
+            wait_time: std::time::Duration::ZERO,
         }
     }
 
@@ -179,6 +190,8 @@ impl ChannelWriter {
 
         tracing::trace!(n, "flushing");
         let ready = self.buffer.split().freeze();
+
+        let wait_started_at = std::time::Instant::now();
 
         // not ideal to call from blocking code to block_on, but we are sure that this
         // operation does not spawn_blocking other tasks
@@ -192,6 +205,9 @@ impl ChannelWriter {
             // sending it to the client.
             Ok(())
         });
+
+        self.wait_time += wait_started_at.elapsed();
+
         if res.is_err() {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
@@ -201,6 +217,10 @@ impl ChannelWriter {
 
     pub fn flushed_bytes(&self) -> usize {
         self.written
+    }
+
+    pub fn wait_time(&self) -> std::time::Duration {
+        self.wait_time
     }
 }
 
@@ -231,7 +251,7 @@ impl std::io::Write for ChannelWriter {
     }
 }
 
-async fn prometheus_metrics_handler(_req: Request<Body>) -> Result<Response<Body>, ApiError> {
+pub async fn prometheus_metrics_handler(_req: Request<Body>) -> Result<Response<Body>, ApiError> {
     SERVE_METRICS_COUNT.inc();
 
     let started_at = std::time::Instant::now();
@@ -252,22 +272,52 @@ async fn prometheus_metrics_handler(_req: Request<Body>) -> Result<Response<Body
 
     let span = info_span!("blocking");
     tokio::task::spawn_blocking(move || {
+        // there are situations where we lose scraped metrics under load, try to gather some clues
+        // since all nodes are queried this, keep the message count low.
+        let spawned_at = std::time::Instant::now();
+
         let _span = span.entered();
+
         let metrics = metrics::gather();
+
+        let gathered_at = std::time::Instant::now();
+
         let res = encoder
             .encode(&metrics, &mut writer)
             .and_then(|_| writer.flush().map_err(|e| e.into()));
+
+        // this instant is not when we finally got the full response sent, sending is done by hyper
+        // in another task.
+        let encoded_at = std::time::Instant::now();
+
+        let spawned_in = spawned_at - started_at;
+        let collected_in = gathered_at - spawned_at;
+        // remove the wait time here in case the tcp connection was clogged
+        let encoded_in = encoded_at - gathered_at - writer.wait_time();
+        let total = encoded_at - started_at;
 
         match res {
             Ok(()) => {
                 tracing::info!(
                     bytes = writer.flushed_bytes(),
-                    elapsed_ms = started_at.elapsed().as_millis(),
+                    total_ms = total.as_millis(),
+                    spawning_ms = spawned_in.as_millis(),
+                    collection_ms = collected_in.as_millis(),
+                    encoding_ms = encoded_in.as_millis(),
                     "responded /metrics"
                 );
             }
             Err(e) => {
-                tracing::warn!("failed to write out /metrics response: {e:#}");
+                // there is a chance that this error is not the BrokenPipe we generate in the writer
+                // for "closed connection", but it is highly unlikely.
+                tracing::warn!(
+                    after_bytes = writer.flushed_bytes(),
+                    total_ms = total.as_millis(),
+                    spawning_ms = spawned_in.as_millis(),
+                    collection_ms = collected_in.as_millis(),
+                    encoding_ms = encoded_in.as_millis(),
+                    "failed to write out /metrics response: {e:?}"
+                );
                 // semantics of this error are quite... unclear. we want to error the stream out to
                 // abort the response to somehow notify the client that we failed.
                 //
@@ -282,6 +332,211 @@ async fn prometheus_metrics_handler(_req: Request<Body>) -> Result<Response<Body
     });
 
     Ok(response)
+}
+
+/// Generates CPU profiles.
+pub async fn profile_cpu_handler(req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    enum Format {
+        Pprof,
+        Svg,
+    }
+
+    // Parameters.
+    let format = match get_query_param(&req, "format")?.as_deref() {
+        None => Format::Pprof,
+        Some("pprof") => Format::Pprof,
+        Some("svg") => Format::Svg,
+        Some(format) => return Err(ApiError::BadRequest(anyhow!("invalid format {format}"))),
+    };
+    let seconds = match parse_query_param(&req, "seconds")? {
+        None => 5,
+        Some(seconds @ 1..=60) => seconds,
+        Some(_) => return Err(ApiError::BadRequest(anyhow!("duration must be 1-60 secs"))),
+    };
+    let frequency_hz = match parse_query_param(&req, "frequency")? {
+        None => 99,
+        Some(1001..) => return Err(ApiError::BadRequest(anyhow!("frequency must be <=1000 Hz"))),
+        Some(frequency) => frequency,
+    };
+    let force: bool = parse_query_param(&req, "force")?.unwrap_or_default();
+
+    // Take the profile.
+    static PROFILE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static PROFILE_CANCEL: Lazy<Notify> = Lazy::new(Notify::new);
+
+    let report = {
+        // Only allow one profiler at a time. If force is true, cancel a running profile (e.g. a
+        // Grafana continuous profile). We use a try_lock() loop when cancelling instead of waiting
+        // for a lock(), to avoid races where the notify isn't currently awaited.
+        let _lock = loop {
+            match PROFILE_LOCK.try_lock() {
+                Ok(lock) => break lock,
+                Err(_) if force => PROFILE_CANCEL.notify_waiters(),
+                Err(_) => {
+                    return Err(ApiError::Conflict(
+                        "profiler already running (use ?force=true to cancel it)".into(),
+                    ))
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await; // don't busy-wait
+        };
+
+        let guard = ProfilerGuardBuilder::default()
+            .frequency(frequency_hz)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .map_err(|err| ApiError::InternalServerError(err.into()))?;
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(seconds)) => {},
+            _ = PROFILE_CANCEL.notified() => {},
+        };
+
+        guard
+            .report()
+            .build()
+            .map_err(|err| ApiError::InternalServerError(err.into()))?
+    };
+
+    // Return the report in the requested format.
+    match format {
+        Format::Pprof => {
+            let mut body = Vec::new();
+            report
+                .pprof()
+                .map_err(|err| ApiError::InternalServerError(err.into()))?
+                .write_to_vec(&mut body)
+                .map_err(|err| ApiError::InternalServerError(err.into()))?;
+
+            Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_DISPOSITION, "attachment; filename=\"profile.pb\"")
+                .body(Body::from(body))
+                .map_err(|err| ApiError::InternalServerError(err.into()))
+        }
+
+        Format::Svg => {
+            let mut body = Vec::new();
+            report
+                .flamegraph(&mut body)
+                .map_err(|err| ApiError::InternalServerError(err.into()))?;
+            Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "image/svg+xml")
+                .body(Body::from(body))
+                .map_err(|err| ApiError::InternalServerError(err.into()))
+        }
+    }
+}
+
+/// Generates heap profiles.
+///
+/// This only works with jemalloc on Linux.
+pub async fn profile_heap_handler(req: Request<Body>) -> Result<Response<Body>, ApiError> {
+    enum Format {
+        Jemalloc,
+        Pprof,
+        Svg,
+    }
+
+    // Parameters.
+    let format = match get_query_param(&req, "format")?.as_deref() {
+        None => Format::Pprof,
+        Some("jemalloc") => Format::Jemalloc,
+        Some("pprof") => Format::Pprof,
+        Some("svg") => Format::Svg,
+        Some(format) => return Err(ApiError::BadRequest(anyhow!("invalid format {format}"))),
+    };
+
+    // Functions and mappings to strip when symbolizing pprof profiles. If true,
+    // also remove child frames.
+    static STRIP_FUNCTIONS: Lazy<Vec<(Regex, bool)>> = Lazy::new(|| {
+        vec![
+            (Regex::new("^__rust").unwrap(), false),
+            (Regex::new("^_start$").unwrap(), false),
+            (Regex::new("^irallocx_prof").unwrap(), true),
+            (Regex::new("^prof_alloc_prep").unwrap(), true),
+            (Regex::new("^std::rt::lang_start").unwrap(), false),
+            (Regex::new("^std::sys::backtrace::__rust").unwrap(), false),
+        ]
+    });
+    const STRIP_MAPPINGS: &[&str] = &["libc", "libgcc", "pthread", "vdso"];
+
+    // Obtain profiler handle.
+    let mut prof_ctl = jemalloc_pprof::PROF_CTL
+        .as_ref()
+        .ok_or(ApiError::InternalServerError(anyhow!(
+            "heap profiling not enabled"
+        )))?
+        .lock()
+        .await;
+    if !prof_ctl.activated() {
+        return Err(ApiError::InternalServerError(anyhow!(
+            "heap profiling not enabled"
+        )));
+    }
+
+    // Take and return the profile.
+    match format {
+        Format::Jemalloc => {
+            // NB: file is an open handle to a tempfile that's already deleted.
+            let file = tokio::task::spawn_blocking(move || prof_ctl.dump())
+                .await
+                .map_err(|join_err| ApiError::InternalServerError(join_err.into()))?
+                .map_err(ApiError::InternalServerError)?;
+            let stream = ReaderStream::new(tokio::fs::File::from_std(file));
+            Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_DISPOSITION, "attachment; filename=\"heap.dump\"")
+                .body(Body::wrap_stream(stream))
+                .map_err(|err| ApiError::InternalServerError(err.into()))
+        }
+
+        Format::Pprof => {
+            let data = tokio::task::spawn_blocking(move || {
+                let bytes = prof_ctl.dump_pprof()?;
+                // Symbolize the profile.
+                // TODO: consider moving this upstream to jemalloc_pprof and avoiding the
+                // serialization roundtrip.
+                let profile = pprof::decode(&bytes)?;
+                let profile = pprof::symbolize(profile)?;
+                let profile = pprof::strip_locations(profile, STRIP_MAPPINGS, &STRIP_FUNCTIONS);
+                pprof::encode(&profile)
+            })
+            .await
+            .map_err(|join_err| ApiError::InternalServerError(join_err.into()))?
+            .map_err(ApiError::InternalServerError)?;
+            Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_DISPOSITION, "attachment; filename=\"heap.pb\"")
+                .body(Body::from(data))
+                .map_err(|err| ApiError::InternalServerError(err.into()))
+        }
+
+        Format::Svg => {
+            let body = tokio::task::spawn_blocking(move || {
+                let bytes = prof_ctl.dump_pprof()?;
+                let profile = pprof::decode(&bytes)?;
+                let profile = pprof::symbolize(profile)?;
+                let profile = pprof::strip_locations(profile, STRIP_MAPPINGS, &STRIP_FUNCTIONS);
+                let mut opts = inferno::flamegraph::Options::default();
+                opts.title = "Heap inuse".to_string();
+                opts.count_name = "bytes".to_string();
+                pprof::flamegraph(profile, &mut opts)
+            })
+            .await
+            .map_err(|join_err| ApiError::InternalServerError(join_err.into()))?
+            .map_err(ApiError::InternalServerError)?;
+            Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "image/svg+xml")
+                .body(Body::from(body))
+                .map_err(|err| ApiError::InternalServerError(err.into()))
+        }
+    }
 }
 
 pub fn add_request_id_middleware<B: hyper::body::HttpBody + Send + Sync + 'static>(
@@ -323,7 +578,6 @@ pub fn make_router() -> RouterBuilder<hyper::Body, ApiError> {
         .middleware(Middleware::post_with_info(
             add_request_id_header_to_response,
         ))
-        .get("/metrics", |r| request_span(r, prometheus_metrics_handler))
         .err_handler(route_error_handler)
 }
 

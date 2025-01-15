@@ -24,6 +24,7 @@
  * PushPage ('P'): Copy a page image (in the payload) to buffer cache
  * ApplyRecord ('A'): Apply a WAL record (in the payload)
  * GetPage ('G'): Return a page image from buffer cache.
+ * Ping ('H'): Return the input message.
  *
  * Currently, you only get a response to GetPage requests; the response is
  * simply a 8k page, without any headers. Errors are logged to stderr.
@@ -100,6 +101,9 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/dsm.h"
+#if PG_MAJORVERSION_NUM >= 17
+#include "storage/dsm_registry.h"
+#endif
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
@@ -130,59 +134,100 @@ static void ApplyRecord(StringInfo input_message);
 static void apply_error_callback(void *arg);
 static bool redo_block_filter(XLogReaderState *record, uint8 block_id);
 static void GetPage(StringInfo input_message);
+static void Ping(StringInfo input_message);
 static ssize_t buffered_read(void *buf, size_t count);
-static void CreateFakeSharedMemoryAndSemaphores();
+static void CreateFakeSharedMemoryAndSemaphores(void);
 
 static BufferTag target_redo_tag;
 
 static XLogReaderState *reader_state;
 
-#define TRACE DEBUG5
+#define TRACE LOG
 
 #ifdef HAVE_LIBSECCOMP
+
+
+/*
+ * https://man7.org/linux/man-pages/man2/close_range.2.html
+ *
+ * The `close_range` syscall is available as of Linux 5.9.
+ *
+ * The `close_range` libc wrapper is only available in glibc >= 2.34.
+ * Debian Bullseye ships a libc package based on glibc 2.31.
+ * => write the wrapper ourselves, using the syscall number from the kernel headers.
+ *
+ * If the Linux uAPI headers don't define the system call number,
+ * fail the build deliberately rather than ifdef'ing it to ENOSYS.
+ * We prefer a compile time over a runtime error for walredo.
+ */
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <errno.h>
+
+static int
+close_range_syscall(unsigned int start_fd, unsigned int count, unsigned int flags)
+{
+    return syscall(__NR_close_range, start_fd, count, flags);
+}
+
+
+static PgSeccompRule allowed_syscalls[] =
+{
+	/* Hard requirements */
+	PG_SCMP_ALLOW(exit_group),
+	PG_SCMP_ALLOW(pselect6),
+	PG_SCMP_ALLOW(read),
+	PG_SCMP_ALLOW(select),
+	PG_SCMP_ALLOW(write),
+
+	/* Memory allocation */
+	PG_SCMP_ALLOW(brk),
+#ifndef MALLOC_NO_MMAP
+	/* TODO: musl doesn't have mallopt */
+	PG_SCMP_ALLOW(mmap),
+	PG_SCMP_ALLOW(munmap),
+#endif
+	/*
+	 * getpid() is called on assertion failure, in ExceptionalCondition.
+	 * It's not really needed, but seems pointless to hide it either. The
+	 * system call unlikely to expose a kernel vulnerability, and the PID
+	 * is stored in MyProcPid anyway.
+	 */
+	PG_SCMP_ALLOW(getpid),
+
+	/* Enable those for a proper shutdown. */
+#if 0
+	   PG_SCMP_ALLOW(munmap),
+	   PG_SCMP_ALLOW(shmctl),
+	   PG_SCMP_ALLOW(shmdt),
+	   PG_SCMP_ALLOW(unlink),	/* shm_unlink */
+#endif
+};
+
 static void
 enter_seccomp_mode(void)
 {
-	PgSeccompRule syscalls[] =
-	{
-		/* Hard requirements */
-		PG_SCMP_ALLOW(exit_group),
-		PG_SCMP_ALLOW(pselect6),
-		PG_SCMP_ALLOW(read),
-		PG_SCMP_ALLOW(select),
-		PG_SCMP_ALLOW(write),
-
-		/* Memory allocation */
-		PG_SCMP_ALLOW(brk),
-#ifndef MALLOC_NO_MMAP
-		/* TODO: musl doesn't have mallopt */
-		PG_SCMP_ALLOW(mmap),
-		PG_SCMP_ALLOW(munmap),
-#endif
-		/*
-		 * getpid() is called on assertion failure, in ExceptionalCondition.
-		 * It's not really needed, but seems pointless to hide it either. The
-		 * system call unlikely to expose a kernel vulnerability, and the PID
-		 * is stored in MyProcPid anyway.
-		 */
-		PG_SCMP_ALLOW(getpid),
-
-		/* Enable those for a proper shutdown.
-		PG_SCMP_ALLOW(munmap),
-		PG_SCMP_ALLOW(shmctl),
-		PG_SCMP_ALLOW(shmdt),
-		PG_SCMP_ALLOW(unlink), // shm_unlink
+	/*
+	 * The pageserver process relies on us to close all the file descriptors
+	 * it potentially leaked to us, _before_ we start processing potentially dangerous
+	 * wal records. See the comment in the Rust code that launches this process.
 	 */
-	};
+	if (close_range_syscall(3, ~0U, 0) != 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_SYSTEM_ERROR),
+				 errmsg("seccomp: could not close files >= fd 3")));
 
 #ifdef MALLOC_NO_MMAP
 	/* Ask glibc not to use mmap() */
 	mallopt(M_MMAP_MAX, 0);
 #endif
 
-	seccomp_load_rules(syscalls, lengthof(syscalls));
+	seccomp_load_rules(allowed_syscalls, lengthof(allowed_syscalls));
 }
 #endif /* HAVE_LIBSECCOMP */
+
+PGDLLEXPORT void
+WalRedoMain(int argc, char *argv[]);
 
 /*
  * Entry point for the WAL redo process.
@@ -353,6 +398,10 @@ WalRedoMain(int argc, char *argv[])
 				GetPage(&input_message);
 				break;
 
+			case 'H': 			/* Ping */
+				Ping(&input_message);
+				break;
+
 				/*
 				 * EOF means we're done. Perform normal shutdown.
 				 */
@@ -402,9 +451,8 @@ WalRedoMain(int argc, char *argv[])
  * half-initialized postgres.
  */
 static void
-CreateFakeSharedMemoryAndSemaphores()
+CreateFakeSharedMemoryAndSemaphores(void)
 {
-	PGShmemHeader *shim = NULL;
 	PGShmemHeader *hdr;
 	Size		size;
 	int			numSemas;
@@ -437,7 +485,6 @@ CreateFakeSharedMemoryAndSemaphores()
 		hdr->totalsize = size;
 		hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
 
-		shim = hdr;
 		UsedShmemSegAddr = hdr;
 		UsedShmemSegID = (unsigned long) 42; /* not relevant for non-shared memory */
 	}
@@ -474,11 +521,13 @@ CreateFakeSharedMemoryAndSemaphores()
 	 */
 	InitShmemIndex();
 
-	dsm_shmem_init();
-
 	/*
 	 * Set up xlog, clog, and buffers
 	 */
+#if PG_MAJORVERSION_NUM >= 17
+	DSMRegistryShmemInit();
+	VarsupShmemInit();
+#endif
 	XLOGShmemInit();
 	CLOGShmemInit();
 	CommitTsShmemInit();
@@ -528,7 +577,10 @@ CreateFakeSharedMemoryAndSemaphores()
 	/*
 	 * Set up other modules that need some shared memory space
 	 */
+#if PG_MAJORVERSION_NUM < 17
+	/* "snapshot too old" was removed in PG17, and with it the SnapMgr */
 	SnapMgrInit();
+#endif
 	BTreeShmemInit();
 	SyncScanShmemInit();
 	/* Skip due to the 'pg_notify' directory check */
@@ -542,10 +594,6 @@ CreateFakeSharedMemoryAndSemaphores()
 	if (!IsUnderPostmaster)
 		ShmemBackendArrayAllocation();
 #endif
-
-	/* Initialize dynamic shared memory facilities. */
-	if (!IsUnderPostmaster)
-		dsm_postmaster_startup(shim);
 
 	/*
 	 * Now give loadable modules a chance to set up their shmem allocations
@@ -704,7 +752,7 @@ BeginRedoForBlock(StringInfo input_message)
 		 target_redo_tag.forkNum,
 		 target_redo_tag.blockNum);
 
-	reln = smgropen(rinfo, InvalidBackendId, RELPERSISTENCE_PERMANENT);
+	reln = smgropen(rinfo, INVALID_PROC_NUMBER, RELPERSISTENCE_PERMANENT);
 	if (reln->smgr_cached_nblocks[forknum] == InvalidBlockNumber ||
 		reln->smgr_cached_nblocks[forknum] < blknum + 1)
 	{
@@ -771,6 +819,9 @@ ApplyRecord(StringInfo input_message)
 	ErrorContextCallback errcallback;
 #if PG_VERSION_NUM >= 150000
 	DecodedXLogRecord *decoded;
+#define STATIC_DECODEBUF_SIZE (64 * 1024)
+	static char *static_decodebuf = NULL;
+	size_t		required_space;
 #endif
 
 	/*
@@ -800,7 +851,19 @@ ApplyRecord(StringInfo input_message)
 	XLogBeginRead(reader_state, lsn);
 
 #if PG_VERSION_NUM >= 150000
-	decoded = (DecodedXLogRecord *) XLogReadRecordAlloc(reader_state, record->xl_tot_len, true);
+	/*
+	 * For reasonably small records, reuse a fixed size buffer to reduce
+	 * palloc overhead.
+	 */
+	required_space = DecodeXLogRecordRequiredSpace(record->xl_tot_len);
+	if (required_space <= STATIC_DECODEBUF_SIZE)
+	{
+		if (static_decodebuf == NULL)
+			static_decodebuf = MemoryContextAlloc(TopMemoryContext, STATIC_DECODEBUF_SIZE);
+		decoded = (DecodedXLogRecord *) static_decodebuf;
+	}
+	else
+		decoded = palloc(required_space);
 
 	if (!DecodeXLogRecord(reader_state, decoded, record, lsn, &errormsg))
 		elog(ERROR, "failed to decode WAL record: %s", errormsg);
@@ -810,36 +873,14 @@ ApplyRecord(StringInfo input_message)
 		decoded->next_lsn = reader_state->NextRecPtr;
 
 		/*
-		 * If it's in the decode buffer, mark the decode buffer space as
-		 * occupied.
-		 */
-		if (!decoded->oversized)
-		{
-			/* The new decode buffer head must be MAXALIGNed. */
-			Assert(decoded->size == MAXALIGN(decoded->size));
-			if ((char *) decoded == reader_state->decode_buffer)
-				reader_state->decode_buffer_tail = reader_state->decode_buffer + decoded->size;
-			else
-				reader_state->decode_buffer_tail += decoded->size;
-		}
-
-		/* Insert it into the queue of decoded records. */
-		Assert(reader_state->decode_queue_tail != decoded);
-		if (reader_state->decode_queue_tail)
-			reader_state->decode_queue_tail->next = decoded;
-		reader_state->decode_queue_tail = decoded;
-		if (!reader_state->decode_queue_head)
-			reader_state->decode_queue_head = decoded;
-
-		/*
 		 * Update the pointers to the beginning and one-past-the-end of this
 		 * record, again for the benefit of historical code that expected the
 		 * decoder to track this rather than accessing these fields of the record
 		 * itself.
 		 */
-		reader_state->record = reader_state->decode_queue_head;
-		reader_state->ReadRecPtr = reader_state->record->lsn;
-		reader_state->EndRecPtr = reader_state->record->next_lsn;
+		reader_state->record = decoded;
+		reader_state->ReadRecPtr = decoded->lsn;
+		reader_state->EndRecPtr = decoded->next_lsn;
 	}
 #else
 	/*
@@ -879,8 +920,9 @@ ApplyRecord(StringInfo input_message)
 
 	elog(TRACE, "applied WAL record with LSN %X/%X",
 		 (uint32) (lsn >> 32), (uint32) lsn);
+
 #if PG_VERSION_NUM >= 150000
-	if (decoded && decoded->oversized)
+	if ((char *) decoded != static_decodebuf)
 		pfree(decoded);
 #endif
 }
@@ -944,7 +986,7 @@ redo_block_filter(XLogReaderState *record, uint8 block_id)
 	 * If this block isn't one we are currently restoring, then return 'true'
 	 * so that this gets ignored
 	 */
-	return !BUFFERTAGS_EQUAL(target_tag, target_redo_tag);
+	return !BufferTagsEqual(&target_tag, &target_redo_tag);
 }
 
 /*
@@ -1012,6 +1054,36 @@ GetPage(StringInfo input_message)
 	wal_redo_buffer = InvalidBuffer;
 
 	elog(TRACE, "Page sent back for block %u", blknum);
+}
+
+
+static void
+Ping(StringInfo input_message)
+{
+	int			tot_written;
+	/* Response: the input message */
+	tot_written = 0;
+	do {
+		ssize_t		rc;
+		/* We don't need alignment, but it's bad practice to use char[BLCKSZ] */
+#if PG_VERSION_NUM >= 160000
+		static const PGIOAlignedBlock response;
+#else
+		static const PGAlignedBlock response;
+#endif
+		rc = write(STDOUT_FILENO, &response.data[tot_written], BLCKSZ - tot_written);
+		if (rc < 0) {
+			/* If interrupted by signal, just retry */
+			if (errno == EINTR)
+				continue;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to stdout: %m")));
+		}
+		tot_written += rc;
+	} while (tot_written < BLCKSZ);
+
+	elog(TRACE, "Page sent back for ping");
 }
 
 

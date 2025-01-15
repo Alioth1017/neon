@@ -28,8 +28,17 @@ pub enum ApiError {
     #[error("Resource temporarily unavailable: {0}")]
     ResourceUnavailable(Cow<'static, str>),
 
+    #[error("Too many requests: {0}")]
+    TooManyRequests(Cow<'static, str>),
+
     #[error("Shutting down")]
     ShuttingDown,
+
+    #[error("Timeout")]
+    Timeout(Cow<'static, str>),
+
+    #[error("Request cancelled")]
+    Cancelled,
 
     #[error(transparent)]
     InternalServerError(anyhow::Error),
@@ -67,8 +76,20 @@ impl ApiError {
                 err.to_string(),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
-            ApiError::InternalServerError(err) => HttpErrorBody::response_from_msg_and_status(
+            ApiError::TooManyRequests(err) => HttpErrorBody::response_from_msg_and_status(
                 err.to_string(),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            ApiError::Timeout(err) => HttpErrorBody::response_from_msg_and_status(
+                err.to_string(),
+                StatusCode::REQUEST_TIMEOUT,
+            ),
+            ApiError::Cancelled => HttpErrorBody::response_from_msg_and_status(
+                self.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            ApiError::InternalServerError(err) => HttpErrorBody::response_from_msg_and_status(
+                format!("{err:#}"), // use alternative formatting so that we give the cause without backtrace
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         }
@@ -124,7 +145,10 @@ pub fn api_error_handler(api_error: ApiError) -> Response<Body> {
         ApiError::ResourceUnavailable(_) => info!("Error processing HTTP request: {api_error:#}"),
         ApiError::NotFound(_) => info!("Error processing HTTP request: {api_error:#}"),
         ApiError::InternalServerError(_) => error!("Error processing HTTP request: {api_error:?}"),
-        _ => error!("Error processing HTTP request: {api_error:#}"),
+        ApiError::ShuttingDown => info!("Shut down while processing HTTP request"),
+        ApiError::Timeout(_) => info!("Timeout while processing HTTP request: {api_error:#}"),
+        ApiError::Cancelled => info!("Request cancelled while processing HTTP request"),
+        _ => info!("Error processing HTTP request: {api_error:#}"),
     }
 
     api_error.into_response()

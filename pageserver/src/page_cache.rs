@@ -17,7 +17,6 @@
 //!
 //! Two types of pages are supported:
 //!
-//! * **Materialized pages**, filled & used by page reconstruction
 //! * **Immutable File pages**, filled & used by [`crate::tenant::block_io`] and [`crate::tenant::ephemeral_file`].
 //!
 //! Note that [`crate::tenant::ephemeral_file::EphemeralFile`] is generally mutable, but, it's append-only.
@@ -27,9 +26,6 @@
 //!
 //! Page cache maps from a cache key to a buffer slot.
 //! The cache key uniquely identifies the piece of data that is being cached.
-//!
-//! The cache key for **materialized pages** is  [`TenantShardId`], [`TimelineId`], [`Key`], and [`Lsn`].
-//! Use [`PageCache::memorize_materialized_page`] and [`PageCache::lookup_materialized_page`] for fill & access.
 //!
 //! The cache key for **immutable file** pages is [`FileId`] and a block number.
 //! Users of page cache that wish to page-cache an arbitrary (immutable!) on-disk file do the following:
@@ -73,7 +69,6 @@
 
 use std::{
     collections::{hash_map::Entry, HashMap},
-    convert::TryInto,
     sync::{
         atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Weak,
@@ -83,13 +78,11 @@ use std::{
 
 use anyhow::Context;
 use once_cell::sync::OnceCell;
-use pageserver_api::shard::TenantShardId;
-use utils::{id::TimelineId, lsn::Lsn};
 
 use crate::{
     context::RequestContext,
     metrics::{page_cache_eviction_metrics, PageCacheSizeMetrics},
-    repository::Key,
+    virtual_file::{IoBufferMut, IoPageSlice},
 };
 
 static PAGE_CACHE: OnceCell<PageCache> = OnceCell::new();
@@ -140,33 +133,7 @@ pub fn next_file_id() -> FileId {
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[allow(clippy::enum_variant_names)]
 enum CacheKey {
-    MaterializedPage {
-        hash_key: MaterializedPageHashKey,
-        lsn: Lsn,
-    },
-    ImmutableFilePage {
-        file_id: FileId,
-        blkno: u32,
-    },
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-struct MaterializedPageHashKey {
-    /// Why is this TenantShardId rather than TenantId?
-    ///
-    /// Usually, the materialized value of a page@lsn is identical on any shard in the same tenant.  However, this
-    /// this not the case for certain internally-generated pages (e.g. relation sizes).  In future, we may make this
-    /// key smaller by omitting the shard, if we ensure that reads to such pages always skip the cache, or are
-    /// special-cased in some other way.
-    tenant_shard_id: TenantShardId,
-    timeline_id: TimelineId,
-    key: Key,
-}
-
-#[derive(Clone)]
-struct Version {
-    lsn: Lsn,
-    slot_idx: usize,
+    ImmutableFilePage { file_id: FileId, blkno: u32 },
 }
 
 struct Slot {
@@ -178,7 +145,7 @@ struct SlotInner {
     key: Option<CacheKey>,
     // for `coalesce_readers_permit`
     permit: std::sync::Mutex<Weak<PinnedSlotsPermit>>,
-    buf: &'static mut [u8; PAGE_SZ],
+    buf: IoPageSlice<'static>,
 }
 
 impl Slot {
@@ -237,17 +204,6 @@ impl SlotInner {
 }
 
 pub struct PageCache {
-    /// This contains the mapping from the cache key to buffer slot that currently
-    /// contains the page, if any.
-    ///
-    /// TODO: This is protected by a single lock. If that becomes a bottleneck,
-    /// this HashMap can be replaced with a more concurrent version, there are
-    /// plenty of such crates around.
-    ///
-    /// If you add support for caching different kinds of objects, each object kind
-    /// can have a separate mapping map, next to this field.
-    materialized_page_map: std::sync::RwLock<HashMap<MaterializedPageHashKey, Vec<Version>>>,
-
     immutable_page_map: std::sync::RwLock<HashMap<(FileId, u32), usize>>,
 
     /// The actual buffers with their metadata.
@@ -262,7 +218,9 @@ pub struct PageCache {
     size_metrics: &'static PageCacheSizeMetrics,
 }
 
-struct PinnedSlotsPermit(tokio::sync::OwnedSemaphorePermit);
+struct PinnedSlotsPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
 
 ///
 /// PageReadGuard is a "lease" on a buffer, for reading. The page is kept locked
@@ -277,13 +235,13 @@ impl std::ops::Deref for PageReadGuard<'_> {
     type Target = [u8; PAGE_SZ];
 
     fn deref(&self) -> &Self::Target {
-        self.slot_guard.buf
+        self.slot_guard.buf.deref()
     }
 }
 
 impl AsRef<[u8; PAGE_SZ]> for PageReadGuard<'_> {
     fn as_ref(&self) -> &[u8; PAGE_SZ] {
-        self.slot_guard.buf
+        self.slot_guard.buf.as_ref()
     }
 }
 
@@ -309,7 +267,7 @@ enum PageWriteGuardState<'i> {
 impl std::ops::DerefMut for PageWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut self.state {
-            PageWriteGuardState::Invalid { inner, _permit } => inner.buf,
+            PageWriteGuardState::Invalid { inner, _permit } => inner.buf.deref_mut(),
             PageWriteGuardState::Downgraded => unreachable!(),
         }
     }
@@ -320,7 +278,7 @@ impl std::ops::Deref for PageWriteGuard<'_> {
 
     fn deref(&self) -> &Self::Target {
         match &self.state {
-            PageWriteGuardState::Invalid { inner, _permit } => inner.buf,
+            PageWriteGuardState::Invalid { inner, _permit } => inner.buf.deref(),
             PageWriteGuardState::Downgraded => unreachable!(),
         }
     }
@@ -370,175 +328,14 @@ pub enum ReadBufResult<'a> {
 }
 
 impl PageCache {
-    //
-    // Section 1.1: Public interface functions for looking up and memorizing materialized page
-    // versions in the page cache
-    //
-
-    /// Look up a materialized page version.
-    ///
-    /// The 'lsn' is an upper bound, this will return the latest version of
-    /// the given block, but not newer than 'lsn'. Returns the actual LSN of the
-    /// returned page.
-    pub async fn lookup_materialized_page(
-        &self,
-        tenant_shard_id: TenantShardId,
-        timeline_id: TimelineId,
-        key: &Key,
-        lsn: Lsn,
-        ctx: &RequestContext,
-    ) -> Option<(Lsn, PageReadGuard)> {
-        let Ok(permit) = self.try_get_pinned_slot_permit().await else {
-            return None;
-        };
-
-        crate::metrics::PAGE_CACHE
-            .for_ctx(ctx)
-            .read_accesses_materialized_page
-            .inc();
-
-        let mut cache_key = CacheKey::MaterializedPage {
-            hash_key: MaterializedPageHashKey {
-                tenant_shard_id,
-                timeline_id,
-                key: *key,
-            },
-            lsn,
-        };
-
-        if let Some(guard) = self
-            .try_lock_for_read(&mut cache_key, &mut Some(permit))
-            .await
-        {
-            if let CacheKey::MaterializedPage {
-                hash_key: _,
-                lsn: available_lsn,
-            } = cache_key
-            {
-                if available_lsn == lsn {
-                    crate::metrics::PAGE_CACHE
-                        .for_ctx(ctx)
-                        .read_hits_materialized_page_exact
-                        .inc();
-                } else {
-                    crate::metrics::PAGE_CACHE
-                        .for_ctx(ctx)
-                        .read_hits_materialized_page_older_lsn
-                        .inc();
-                }
-                Some((available_lsn, guard))
-            } else {
-                panic!("unexpected key type in slot");
-            }
-        } else {
-            None
-        }
-    }
-
-    ///
-    /// Store an image of the given page in the cache.
-    ///
-    pub async fn memorize_materialized_page(
-        &self,
-        tenant_shard_id: TenantShardId,
-        timeline_id: TimelineId,
-        key: Key,
-        lsn: Lsn,
-        img: &[u8],
-    ) -> anyhow::Result<()> {
-        let cache_key = CacheKey::MaterializedPage {
-            hash_key: MaterializedPageHashKey {
-                tenant_shard_id,
-                timeline_id,
-                key,
-            },
-            lsn,
-        };
-
-        let mut permit = Some(self.try_get_pinned_slot_permit().await?);
-        loop {
-            // First check if the key already exists in the cache.
-            if let Some(slot_idx) = self.search_mapping_exact(&cache_key) {
-                // The page was found in the mapping. Lock the slot, and re-check
-                // that it's still what we expected (because we don't released the mapping
-                // lock already, another thread could have evicted the page)
-                let slot = &self.slots[slot_idx];
-                let inner = slot.inner.write().await;
-                if inner.key.as_ref() == Some(&cache_key) {
-                    slot.inc_usage_count();
-                    debug_assert!(
-                        {
-                            let guard = inner.permit.lock().unwrap();
-                            guard.upgrade().is_none()
-                        },
-                        "we hold a write lock, so, no one else should have a permit"
-                    );
-                    debug_assert_eq!(inner.buf.len(), img.len());
-                    // We already had it in cache. Another thread must've put it there
-                    // concurrently. Check that it had the same contents that we
-                    // replayed.
-                    assert!(inner.buf == img);
-                    return Ok(());
-                }
-            }
-            debug_assert!(permit.is_some());
-
-            // Not found. Find a victim buffer
-            let (slot_idx, mut inner) = self
-                .find_victim(permit.as_ref().unwrap())
-                .await
-                .context("Failed to find evict victim")?;
-
-            // Insert mapping for this. At this point, we may find that another
-            // thread did the same thing concurrently. In that case, we evicted
-            // our victim buffer unnecessarily. Put it into the free list and
-            // continue with the slot that the other thread chose.
-            if let Some(_existing_slot_idx) = self.try_insert_mapping(&cache_key, slot_idx) {
-                // TODO: put to free list
-
-                // We now just loop back to start from beginning. This is not
-                // optimal, we'll perform the lookup in the mapping again, which
-                // is not really necessary because we already got
-                // 'existing_slot_idx'.  But this shouldn't happen often enough
-                // to matter much.
-                continue;
-            }
-
-            // Make the slot ready
-            let slot = &self.slots[slot_idx];
-            inner.key = Some(cache_key.clone());
-            slot.set_usage_count(1);
-            // Create a write guard for the slot so we go through the expected motions.
-            debug_assert!(
-                {
-                    let guard = inner.permit.lock().unwrap();
-                    guard.upgrade().is_none()
-                },
-                "we hold a write lock, so, no one else should have a permit"
-            );
-            let mut write_guard = PageWriteGuard {
-                state: PageWriteGuardState::Invalid {
-                    _permit: permit.take().unwrap(),
-                    inner,
-                },
-            };
-            write_guard.copy_from_slice(img);
-            let _ = write_guard.mark_valid();
-            return Ok(());
-        }
-    }
-
-    // Section 1.2: Public interface functions for working with immutable file pages.
-
     pub async fn read_immutable_buf(
         &self,
         file_id: FileId,
         blkno: u32,
         ctx: &RequestContext,
     ) -> anyhow::Result<ReadBufResult> {
-        let mut cache_key = CacheKey::ImmutableFilePage { file_id, blkno };
-
-        self.lock_for_read(&mut cache_key, ctx).await
+        self.lock_for_read(&(CacheKey::ImmutableFilePage { file_id, blkno }), ctx)
+            .await
     }
 
     //
@@ -550,7 +347,6 @@ impl PageCache {
     // not require changes.
 
     async fn try_get_pinned_slot_permit(&self) -> anyhow::Result<PinnedSlotsPermit> {
-        let timer = crate::metrics::PAGE_CACHE_ACQUIRE_PINNED_SLOT_TIME.start_timer();
         match tokio::time::timeout(
             // Choose small timeout, neon_smgr does its own retries.
             // https://neondb.slack.com/archives/C04DGM6SMTM/p1694786876476869
@@ -559,11 +355,10 @@ impl PageCache {
         )
         .await
         {
-            Ok(res) => Ok(PinnedSlotsPermit(
-                res.expect("this semaphore is never closed"),
-            )),
+            Ok(res) => Ok(PinnedSlotsPermit {
+                _permit: res.expect("this semaphore is never closed"),
+            }),
             Err(_timeout) => {
-                timer.stop_and_discard();
                 crate::metrics::page_cache_errors_inc(
                     crate::metrics::PageCacheErrorKind::AcquirePinnedSlotTimeout,
                 );
@@ -574,19 +369,11 @@ impl PageCache {
 
     /// Look up a page in the cache.
     ///
-    /// If the search criteria is not exact, *cache_key is updated with the key
-    /// for exact key of the returned page. (For materialized pages, that means
-    /// that the LSN in 'cache_key' is updated with the LSN of the returned page
-    /// version.)
-    ///
-    /// If no page is found, returns None and *cache_key is left unmodified.
-    ///
     async fn try_lock_for_read(
         &self,
-        cache_key: &mut CacheKey,
+        cache_key: &CacheKey,
         permit: &mut Option<PinnedSlotsPermit>,
     ) -> Option<PageReadGuard> {
-        let cache_key_orig = cache_key.clone();
         if let Some(slot_idx) = self.search_mapping(cache_key) {
             // The page was found in the mapping. Lock the slot, and re-check
             // that it's still what we expected (because we released the mapping
@@ -599,9 +386,6 @@ impl PageCache {
                     _permit: inner.coalesce_readers_permit(permit.take().unwrap()),
                     slot_guard: inner,
                 });
-            } else {
-                // search_mapping might have modified the search key; restore it.
-                *cache_key = cache_key_orig;
             }
         }
         None
@@ -638,15 +422,12 @@ impl PageCache {
     ///
     async fn lock_for_read(
         &self,
-        cache_key: &mut CacheKey,
+        cache_key: &CacheKey,
         ctx: &RequestContext,
     ) -> anyhow::Result<ReadBufResult> {
         let mut permit = Some(self.try_get_pinned_slot_permit().await?);
 
         let (read_access, hit) = match cache_key {
-            CacheKey::MaterializedPage { .. } => {
-                unreachable!("Materialized pages use lookup_materialized_page")
-            }
             CacheKey::ImmutableFilePage { .. } => (
                 &crate::metrics::PAGE_CACHE
                     .for_ctx(ctx)
@@ -718,52 +499,15 @@ impl PageCache {
 
     /// Search for a page in the cache using the given search key.
     ///
-    /// Returns the slot index, if any. If the search criteria is not exact,
-    /// *cache_key is updated with the actual key of the found page.
+    /// Returns the slot index, if any.
     ///
     /// NOTE: We don't hold any lock on the mapping on return, so the slot might
     /// get recycled for an unrelated page immediately after this function
     /// returns.  The caller is responsible for re-checking that the slot still
     /// contains the page with the same key before using it.
     ///
-    fn search_mapping(&self, cache_key: &mut CacheKey) -> Option<usize> {
+    fn search_mapping(&self, cache_key: &CacheKey) -> Option<usize> {
         match cache_key {
-            CacheKey::MaterializedPage { hash_key, lsn } => {
-                let map = self.materialized_page_map.read().unwrap();
-                let versions = map.get(hash_key)?;
-
-                let version_idx = match versions.binary_search_by_key(lsn, |v| v.lsn) {
-                    Ok(version_idx) => version_idx,
-                    Err(0) => return None,
-                    Err(version_idx) => version_idx - 1,
-                };
-                let version = &versions[version_idx];
-                *lsn = version.lsn;
-                Some(version.slot_idx)
-            }
-            CacheKey::ImmutableFilePage { file_id, blkno } => {
-                let map = self.immutable_page_map.read().unwrap();
-                Some(*map.get(&(*file_id, *blkno))?)
-            }
-        }
-    }
-
-    /// Search for a page in the cache using the given search key.
-    ///
-    /// Like 'search_mapping, but performs an "exact" search. Used for
-    /// allocating a new buffer.
-    fn search_mapping_exact(&self, key: &CacheKey) -> Option<usize> {
-        match key {
-            CacheKey::MaterializedPage { hash_key, lsn } => {
-                let map = self.materialized_page_map.read().unwrap();
-                let versions = map.get(hash_key)?;
-
-                if let Ok(version_idx) = versions.binary_search_by_key(lsn, |v| v.lsn) {
-                    Some(versions[version_idx].slot_idx)
-                } else {
-                    None
-                }
-            }
             CacheKey::ImmutableFilePage { file_id, blkno } => {
                 let map = self.immutable_page_map.read().unwrap();
                 Some(*map.get(&(*file_id, *blkno))?)
@@ -776,27 +520,6 @@ impl PageCache {
     ///
     fn remove_mapping(&self, old_key: &CacheKey) {
         match old_key {
-            CacheKey::MaterializedPage {
-                hash_key: old_hash_key,
-                lsn: old_lsn,
-            } => {
-                let mut map = self.materialized_page_map.write().unwrap();
-                if let Entry::Occupied(mut old_entry) = map.entry(old_hash_key.clone()) {
-                    let versions = old_entry.get_mut();
-
-                    if let Ok(version_idx) = versions.binary_search_by_key(old_lsn, |v| v.lsn) {
-                        versions.remove(version_idx);
-                        self.size_metrics
-                            .current_bytes_materialized_page
-                            .sub_page_sz(1);
-                        if versions.is_empty() {
-                            old_entry.remove_entry();
-                        }
-                    }
-                } else {
-                    panic!("could not find old key in mapping")
-                }
-            }
             CacheKey::ImmutableFilePage { file_id, blkno } => {
                 let mut map = self.immutable_page_map.write().unwrap();
                 map.remove(&(*file_id, *blkno))
@@ -813,30 +536,6 @@ impl PageCache {
     /// of the existing mapping and leaves it untouched.
     fn try_insert_mapping(&self, new_key: &CacheKey, slot_idx: usize) -> Option<usize> {
         match new_key {
-            CacheKey::MaterializedPage {
-                hash_key: new_key,
-                lsn: new_lsn,
-            } => {
-                let mut map = self.materialized_page_map.write().unwrap();
-                let versions = map.entry(new_key.clone()).or_default();
-                match versions.binary_search_by_key(new_lsn, |v| v.lsn) {
-                    Ok(version_idx) => Some(versions[version_idx].slot_idx),
-                    Err(version_idx) => {
-                        versions.insert(
-                            version_idx,
-                            Version {
-                                lsn: *new_lsn,
-                                slot_idx,
-                            },
-                        );
-                        self.size_metrics
-                            .current_bytes_materialized_page
-                            .add_page_sz(1);
-                        None
-                    }
-                }
-            }
-
             CacheKey::ImmutableFilePage { file_id, blkno } => {
                 let mut map = self.immutable_page_map.write().unwrap();
                 match map.entry((*file_id, *blkno)) {
@@ -945,17 +644,17 @@ impl PageCache {
         // We could use Vec::leak here, but that potentially also leaks
         // uninitialized reserved capacity. With into_boxed_slice and Box::leak
         // this is avoided.
-        let page_buffer = Box::leak(vec![0u8; num_pages * PAGE_SZ].into_boxed_slice());
+        let page_buffer = IoBufferMut::with_capacity_zeroed(num_pages * PAGE_SZ).leak();
 
         let size_metrics = &crate::metrics::PAGE_CACHE_SIZE;
         size_metrics.max_bytes.set_page_sz(num_pages);
         size_metrics.current_bytes_immutable.set_page_sz(0);
-        size_metrics.current_bytes_materialized_page.set_page_sz(0);
 
         let slots = page_buffer
             .chunks_exact_mut(PAGE_SZ)
             .map(|chunk| {
-                let buf: &mut [u8; PAGE_SZ] = chunk.try_into().unwrap();
+                // SAFETY: Each chunk has `PAGE_SZ` (8192) bytes, greater than 512, still aligned.
+                let buf = unsafe { IoPageSlice::new_unchecked(chunk.try_into().unwrap()) };
 
                 Slot {
                     inner: tokio::sync::RwLock::new(SlotInner {
@@ -969,7 +668,6 @@ impl PageCache {
             .collect();
 
         Self {
-            materialized_page_map: Default::default(),
             immutable_page_map: Default::default(),
             slots,
             next_evict_slot: AtomicUsize::new(0),

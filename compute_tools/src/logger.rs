@@ -1,4 +1,3 @@
-use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::prelude::*;
 
@@ -23,8 +22,7 @@ pub fn init_tracing_and_logging(default_log_level: &str) -> anyhow::Result<()> {
         .with_writer(std::io::stderr);
 
     // Initialize OpenTelemetry
-    let otlp_layer =
-        tracing_utils::init_tracing_without_runtime("compute_ctl").map(OpenTelemetryLayer::new);
+    let otlp_layer = tracing_utils::init_tracing_without_runtime("compute_ctl");
 
     // Put it all together
     tracing_subscriber::registry()
@@ -37,4 +35,10 @@ pub fn init_tracing_and_logging(default_log_level: &str) -> anyhow::Result<()> {
     utils::logging::replace_panic_hook_with_tracing_panic_hook().forget();
 
     Ok(())
+}
+
+/// Replace all newline characters with a special character to make it
+/// easier to grep for log messages.
+pub fn inlinify(s: &str) -> String {
+    s.replace('\n', "\u{200B}")
 }

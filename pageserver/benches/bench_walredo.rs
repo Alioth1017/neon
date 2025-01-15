@@ -1,190 +1,190 @@
-//! Simple benchmarking around walredo.
+//! Quantify a single walredo manager's throughput under N concurrent callers.
 //!
-//! Right now they hope to just set a baseline. Later we can try to expand into latency and
-//! throughput after figuring out the coordinated omission problems below.
+//! The benchmark implementation ([`bench_impl`]) is parametrized by
+//! - `redo_work` => an async closure that takes a `PostgresRedoManager` and performs one redo
+//! - `n_redos` => number of times the benchmark shell execute the `redo_work`
+//! - `nclients` => number of clients (more on this shortly).
 //!
-//! There are two sets of inputs; `short` and `medium`. They were collected on postgres v14 by
-//! logging what happens when a sequential scan is requested on a small table, then picking out two
-//! suitable from logs.
+//! The benchmark impl sets up a multi-threaded tokio runtime with default parameters.
+//! It spawns `nclients` times [`client`] tokio tasks.
+//! Each task executes the `redo_work` `n_redos/nclients` times.
+//!
+//! We exercise the following combinations:
+//! - `redo_work = ping / short / medium``
+//! - `nclients = [1, 2, 4, 8, 16, 32, 64, 128]`
+//!
+//! We let `criterion` determine the `n_redos` using `iter_custom`.
+//! The idea is that for each `(redo_work, nclients)` combination,
+//! criterion will run the `bench_impl` multiple times with different `n_redos`.
+//! The `bench_impl` reports the aggregate wall clock time from the clients' perspective.
+//! Criterion will divide that by `n_redos` to compute the "time per iteration".
+//! In our case, "time per iteration" means "time per redo_work execution".
+//!
+//! NB: the way by which `iter_custom` determines the "number of iterations"
+//! is called sampling. Apparently the idea here is to detect outliers.
+//! We're not sure whether the current choice of sampling method makes sense.
+//! See https://bheisler.github.io/criterion.rs/book/user_guide/command_line_output.html#collecting-samples
+//!
+//! # Reference Numbers
+//!
+//! 2024-09-18 on im4gn.2xlarge
+//!
+//! ```text
+//! ping/1                  time:   [21.789 µs 21.918 µs 22.078 µs]
+//! ping/2                  time:   [27.686 µs 27.812 µs 27.970 µs]
+//! ping/4                  time:   [35.468 µs 35.671 µs 35.926 µs]
+//! ping/8                  time:   [59.682 µs 59.987 µs 60.363 µs]
+//! ping/16                 time:   [101.79 µs 102.37 µs 103.08 µs]
+//! ping/32                 time:   [184.18 µs 185.15 µs 186.36 µs]
+//! ping/64                 time:   [349.86 µs 351.45 µs 353.47 µs]
+//! ping/128                time:   [684.53 µs 687.98 µs 692.17 µs]
+//! short/1                 time:   [31.833 µs 32.126 µs 32.428 µs]
+//! short/2                 time:   [35.558 µs 35.756 µs 35.992 µs]
+//! short/4                 time:   [44.850 µs 45.138 µs 45.484 µs]
+//! short/8                 time:   [65.985 µs 66.379 µs 66.853 µs]
+//! short/16                time:   [127.06 µs 127.90 µs 128.87 µs]
+//! short/32                time:   [252.98 µs 254.70 µs 256.73 µs]
+//! short/64                time:   [497.13 µs 499.86 µs 503.26 µs]
+//! short/128               time:   [987.46 µs 993.45 µs 1.0004 ms]
+//! medium/1                time:   [137.91 µs 138.55 µs 139.35 µs]
+//! medium/2                time:   [192.00 µs 192.91 µs 194.07 µs]
+//! medium/4                time:   [389.62 µs 391.55 µs 394.01 µs]
+//! medium/8                time:   [776.80 µs 780.33 µs 784.77 µs]
+//! medium/16               time:   [1.5323 ms 1.5383 ms 1.5459 ms]
+//! medium/32               time:   [3.0120 ms 3.0226 ms 3.0350 ms]
+//! medium/64               time:   [5.7405 ms 5.7787 ms 5.8166 ms]
+//! medium/128              time:   [10.412 ms 10.574 ms 10.718 ms]
+//! ```
 
-use std::sync::{Arc, Barrier};
-
+use anyhow::Context;
 use bytes::{Buf, Bytes};
-use pageserver::{
-    config::PageServerConf, repository::Key, walrecord::NeonWalRecord, walredo::PostgresRedoManager,
+use criterion::{BenchmarkId, Criterion};
+use once_cell::sync::Lazy;
+use pageserver::{config::PageServerConf, walredo::PostgresRedoManager};
+use pageserver_api::record::NeonWalRecord;
+use pageserver_api::{key::Key, shard::TenantShardId};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
 };
+use tokio::{sync::Barrier, task::JoinSet};
 use utils::{id::TenantId, lsn::Lsn};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+fn bench(c: &mut Criterion) {
+    macro_rules! bench_group {
+        ($name:expr, $redo_work:expr) => {{
+            let name: &str = $name;
+            let nclients = [1, 2, 4, 8, 16, 32, 64, 128];
+            for nclients in nclients {
+                let mut group = c.benchmark_group(name);
+                group.bench_with_input(
+                    BenchmarkId::from_parameter(nclients),
+                    &nclients,
+                    |b, nclients| {
+                        b.iter_custom(|iters| bench_impl($redo_work, iters, *nclients));
+                    },
+                );
+            }
+        }};
+    }
+    //
+    // benchmark the protocol implementation
+    //
+    let pg_version = 14;
+    bench_group!(
+        "ping",
+        Arc::new(move |mgr: Arc<PostgresRedoManager>| async move {
+            let _: () = mgr.ping(pg_version).await.unwrap();
+        })
+    );
+    //
+    // benchmarks with actual record redo
+    //
+    let make_redo_work = |req: &'static Request| {
+        Arc::new(move |mgr: Arc<PostgresRedoManager>| async move {
+            let page = req.execute(&mgr).await.unwrap();
+            assert_eq!(page.remaining(), 8192);
+        })
+    };
+    bench_group!("short", {
+        static REQUEST: Lazy<Request> = Lazy::new(Request::short_input);
+        make_redo_work(&REQUEST)
+    });
+    bench_group!("medium", {
+        static REQUEST: Lazy<Request> = Lazy::new(Request::medium_input);
+        make_redo_work(&REQUEST)
+    });
+}
+criterion::criterion_group!(benches, bench);
+criterion::criterion_main!(benches);
 
-fn redo_scenarios(c: &mut Criterion) {
-    // logging should be enabled when adding more inputs, since walredo will only report malformed
-    // input to the stderr.
-    // utils::logging::init(utils::logging::LogFormat::Plain).unwrap();
-
+// Returns the sum of each client's wall-clock time spent executing their share of the n_redos.
+fn bench_impl<F, Fut>(redo_work: Arc<F>, n_redos: u64, nclients: u64) -> Duration
+where
+    F: Fn(Arc<PostgresRedoManager>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let repo_dir = camino_tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
 
     let conf = PageServerConf::dummy_conf(repo_dir.path().to_path_buf());
     let conf = Box::leak(Box::new(conf));
-    let tenant_id = TenantId::generate();
+    let tenant_shard_id = TenantShardId::unsharded(TenantId::generate());
 
-    let manager = PostgresRedoManager::new(conf, tenant_id);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
+    let start = Arc::new(Barrier::new(nclients as usize));
+
+    let mut tasks = JoinSet::new();
+
+    let manager = PostgresRedoManager::new(conf, tenant_shard_id);
     let manager = Arc::new(manager);
 
-    {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        tracing::info!("executing first");
-        short().execute(rt.handle(), &manager).unwrap();
-        tracing::info!("first executed");
+    // divide the amount of work equally among the clients.
+    let nredos_per_client = n_redos / nclients;
+    for _ in 0..nclients {
+        rt.block_on(async {
+            tasks.spawn(client(
+                Arc::clone(&manager),
+                Arc::clone(&start),
+                Arc::clone(&redo_work),
+                nredos_per_client,
+            ))
+        });
     }
 
-    let thread_counts = [1, 2, 4, 8, 16];
-
-    let mut group = c.benchmark_group("short");
-    group.sampling_mode(criterion::SamplingMode::Flat);
-
-    for thread_count in thread_counts {
-        group.bench_with_input(
-            BenchmarkId::new("short", thread_count),
-            &thread_count,
-            |b, thread_count| {
-                add_multithreaded_walredo_requesters(b, *thread_count, &manager, short);
-            },
-        );
-    }
-    drop(group);
-
-    let mut group = c.benchmark_group("medium");
-    group.sampling_mode(criterion::SamplingMode::Flat);
-
-    for thread_count in thread_counts {
-        group.bench_with_input(
-            BenchmarkId::new("medium", thread_count),
-            &thread_count,
-            |b, thread_count| {
-                add_multithreaded_walredo_requesters(b, *thread_count, &manager, medium);
-            },
-        );
-    }
-    drop(group);
-}
-
-/// Sets up `threads` number of requesters to `request_redo`, with the given input.
-fn add_multithreaded_walredo_requesters(
-    b: &mut criterion::Bencher,
-    threads: u32,
-    manager: &Arc<PostgresRedoManager>,
-    input_factory: fn() -> Request,
-) {
-    assert_ne!(threads, 0);
-
-    if threads == 1 {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let handle = rt.handle();
-        b.iter_batched_ref(
-            || Some(input_factory()),
-            |input| execute_all(input.take(), handle, manager),
-            criterion::BatchSize::PerIteration,
-        );
-    } else {
-        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(threads as usize);
-
-        let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
-
-        let barrier = Arc::new(Barrier::new(threads as usize + 1));
-
-        let jhs = (0..threads)
-            .map(|_| {
-                std::thread::spawn({
-                    let manager = manager.clone();
-                    let barrier = barrier.clone();
-                    let work_rx = work_rx.clone();
-                    move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .unwrap();
-                        let handle = rt.handle();
-                        loop {
-                            // queue up and wait if we want to go another round
-                            if work_rx.lock().unwrap().recv().is_err() {
-                                break;
-                            }
-
-                            let input = Some(input_factory());
-
-                            barrier.wait();
-
-                            execute_all(input, handle, &manager).unwrap();
-
-                            barrier.wait();
-                        }
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let _jhs = JoinOnDrop(jhs);
-
-        b.iter_batched(
-            || {
-                for _ in 0..threads {
-                    work_tx.send(()).unwrap()
-                }
-            },
-            |()| {
-                // start the work
-                barrier.wait();
-
-                // wait for work to complete
-                barrier.wait();
-            },
-            criterion::BatchSize::PerIteration,
-        );
-
-        drop(work_tx);
-    }
-}
-
-struct JoinOnDrop(Vec<std::thread::JoinHandle<()>>);
-
-impl Drop for JoinOnDrop {
-    // it's not really needless because we want join all then check for panicks
-    #[allow(clippy::needless_collect)]
-    fn drop(&mut self) {
-        // first join all
-        let results = self.0.drain(..).map(|jh| jh.join()).collect::<Vec<_>>();
-        // then check the results; panicking here is not great, but it does get the message across
-        // to the user, and sets an exit value.
-        results.into_iter().try_for_each(|res| res).unwrap();
-    }
-}
-
-fn execute_all<I>(
-    input: I,
-    handle: &tokio::runtime::Handle,
-    manager: &PostgresRedoManager,
-) -> anyhow::Result<()>
-where
-    I: IntoIterator<Item = Request>,
-{
-    // just fire all requests as fast as possible
-    input.into_iter().try_for_each(|req| {
-        let page = req.execute(handle, manager)?;
-        assert_eq!(page.remaining(), 8192);
-        anyhow::Ok(())
+    rt.block_on(async move {
+        let mut total_wallclock_time = Duration::ZERO;
+        while let Some(res) = tasks.join_next().await {
+            total_wallclock_time += res.unwrap();
+        }
+        total_wallclock_time
     })
 }
 
-criterion_group!(benches, redo_scenarios);
-criterion_main!(benches);
+async fn client<F, Fut>(
+    mgr: Arc<PostgresRedoManager>,
+    start: Arc<Barrier>,
+    redo_work: Arc<F>,
+    n_redos: u64,
+) -> Duration
+where
+    F: Fn(Arc<PostgresRedoManager>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    start.wait().await;
+    let start = Instant::now();
+    for _ in 0..n_redos {
+        redo_work(Arc::clone(&mgr)).await;
+        // The real pageserver will rarely if ever do 2 walredos in a row without
+        // yielding to the executor.
+        tokio::task::yield_now().await;
+    }
+    start.elapsed()
+}
 
 macro_rules! lsn {
     ($input:expr) => {{
@@ -196,12 +196,47 @@ macro_rules! lsn {
     }};
 }
 
-/// Short payload, 1132 bytes.
-// pg_records are copypasted from log, where they are put with Debug impl of Bytes, which uses \0
-// for null bytes.
-#[allow(clippy::octal_escapes)]
-fn short() -> Request {
-    Request {
+/// Simple wrapper around `WalRedoManager::request_redo`.
+///
+/// In benchmarks this is cloned around.
+#[derive(Clone)]
+struct Request {
+    key: Key,
+    lsn: Lsn,
+    base_img: Option<(Lsn, Bytes)>,
+    records: Vec<(Lsn, NeonWalRecord)>,
+    pg_version: u32,
+}
+
+impl Request {
+    async fn execute(&self, manager: &PostgresRedoManager) -> anyhow::Result<Bytes> {
+        let Request {
+            key,
+            lsn,
+            base_img,
+            records,
+            pg_version,
+        } = self;
+
+        // TODO: avoid these clones
+        manager
+            .request_redo(*key, *lsn, base_img.clone(), records.clone(), *pg_version)
+            .await
+            .context("request_redo")
+    }
+
+    fn pg_record(will_init: bool, bytes: &'static [u8]) -> NeonWalRecord {
+        let rec = Bytes::from_static(bytes);
+        NeonWalRecord::Postgres { will_init, rec }
+    }
+
+    /// Short payload, 1132 bytes.
+    // pg_records are copypasted from log, where they are put with Debug impl of Bytes, which uses \0
+    // for null bytes.
+    #[allow(clippy::octal_escapes)]
+    pub fn short_input() -> Request {
+        let pg_record = Self::pg_record;
+        Request {
         key: Key {
             field1: 0,
             field2: 1663,
@@ -224,13 +259,14 @@ fn short() -> Request {
         ],
         pg_version: 14,
     }
-}
+    }
 
-/// Medium sized payload, serializes as 26393 bytes.
-// see [`short`]
-#[allow(clippy::octal_escapes)]
-fn medium() -> Request {
-    Request {
+    /// Medium sized payload, serializes as 26393 bytes.
+    // see [`short`]
+    #[allow(clippy::octal_escapes)]
+    pub fn medium_input() -> Request {
+        let pg_record = Self::pg_record;
+        Request {
         key: Key {
             field1: 0,
             field2: 1663,
@@ -472,39 +508,5 @@ fn medium() -> Request {
         ],
         pg_version: 14,
     }
-}
-
-fn pg_record(will_init: bool, bytes: &'static [u8]) -> NeonWalRecord {
-    let rec = Bytes::from_static(bytes);
-    NeonWalRecord::Postgres { will_init, rec }
-}
-
-/// Simple wrapper around `WalRedoManager::request_redo`.
-///
-/// In benchmarks this is cloned around.
-#[derive(Clone)]
-struct Request {
-    key: Key,
-    lsn: Lsn,
-    base_img: Option<(Lsn, Bytes)>,
-    records: Vec<(Lsn, NeonWalRecord)>,
-    pg_version: u32,
-}
-
-impl Request {
-    fn execute(
-        self,
-        rt: &tokio::runtime::Handle,
-        manager: &PostgresRedoManager,
-    ) -> anyhow::Result<Bytes> {
-        let Request {
-            key,
-            lsn,
-            base_img,
-            records,
-            pg_version,
-        } = self;
-
-        rt.block_on(manager.request_redo(key, lsn, base_img, records, pg_version))
     }
 }

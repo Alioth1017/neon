@@ -1,3 +1,4 @@
+use std::num::ParseIntError;
 use std::{fmt, str::FromStr};
 
 use anyhow::Context;
@@ -87,12 +88,6 @@ impl<'de> Deserialize<'de> for Id {
 }
 
 impl Id {
-    pub fn get_from_buf(buf: &mut impl bytes::Buf) -> Id {
-        let mut arr = [0u8; 16];
-        buf.copy_to_slice(&mut arr);
-        Id::from(arr)
-    }
-
     pub fn from_slice(src: &[u8]) -> Result<Id, IdError> {
         if src.len() != 16 {
             return Err(IdError::SliceParseError(src.len()));
@@ -178,10 +173,6 @@ impl fmt::Debug for Id {
 macro_rules! id_newtype {
     ($t:ident) => {
         impl $t {
-            pub fn get_from_buf(buf: &mut impl bytes::Buf) -> $t {
-                $t(Id::get_from_buf(buf))
-            }
-
             pub fn from_slice(src: &[u8]) -> Result<$t, IdError> {
                 Ok($t(Id::from_slice(src)?))
             }
@@ -248,8 +239,10 @@ macro_rules! id_newtype {
     };
 }
 
-/// Neon timeline IDs are different from PostgreSQL timeline
-/// IDs. They serve a similar purpose though: they differentiate
+/// Neon timeline ID.
+///
+/// They are different from PostgreSQL timeline
+/// IDs, but serve a similar purpose: they differentiate
 /// between different "histories" of the same cluster.  However,
 /// PostgreSQL timeline IDs are a bit cumbersome, because they are only
 /// 32-bits wide, and they must be in ascending order in any given
@@ -300,17 +293,6 @@ impl TryFrom<Option<&str>> for TimelineId {
 pub struct TenantId(Id);
 
 id_newtype!(TenantId);
-
-/// Neon Connection Id identifies long-lived connections (for example a pagestream
-/// connection with the page_service). Is used for better logging and tracing
-///
-/// NOTE: It (de)serializes as an array of hex bytes, so the string representation would look
-/// like `[173,80,132,115,129,226,72,254,170,201,135,108,199,26,228,24]`.
-/// See [`Id`] for alternative ways to serialize it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct ConnectionId(Id);
-
-id_newtype!(ConnectionId);
 
 // A pair uniquely identifying Neon instance.
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -371,6 +353,13 @@ pub struct NodeId(pub u64);
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for NodeId {
+    type Err = ParseIntError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(NodeId(u64::from_str(s)?))
     }
 }
 

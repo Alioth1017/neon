@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import time
 
@@ -74,8 +76,8 @@ def test_large_schema(neon_env_builder: NeonEnvBuilder):
     cur.execute("select * from pg_depend order by refclassid, refobjid, refobjsubid")
 
     # Check layer file sizes
-    timeline_path = "{}/tenants/{}/timelines/{}/".format(
-        env.pageserver.workdir, env.initial_tenant, env.initial_timeline
+    timeline_path = (
+        f"{env.pageserver.workdir}/tenants/{env.initial_tenant}/timelines/{env.initial_timeline}/"
     )
     for filename in os.listdir(timeline_path):
         if filename.startswith("00000"):

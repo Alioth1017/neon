@@ -1,32 +1,33 @@
-//! Thread removing old WAL.
+use utils::lsn::Lsn;
 
-use std::time::Duration;
+use crate::timeline_manager::StateSnapshot;
 
-use tokio::time::sleep;
-use tracing::*;
+/// Get oldest LSN we still need to keep.
+///
+/// We hold WAL till it is consumed by
+/// 1) pageserver (remote_consistent_lsn)
+/// 2) s3 offloading.
+/// 3) Additionally we must store WAL since last local commit_lsn because
+///    that's where we start looking for last WAL record on start.
+///
+/// If some peer safekeeper misses data it will fetch it from the remote
+/// storage. While it is safe to use inmem values for determining horizon, we
+/// use persistent to make possible normal states less surprising. All segments
+/// covering LSNs before horizon_lsn can be removed.
+pub(crate) fn calc_horizon_lsn(state: &StateSnapshot, extra_horizon_lsn: Option<Lsn>) -> Lsn {
+    use std::cmp::min;
 
-use crate::{GlobalTimelines, SafeKeeperConf};
-
-pub async fn task_main(conf: SafeKeeperConf) -> anyhow::Result<()> {
-    let wal_removal_interval = Duration::from_millis(5000);
-    loop {
-        let tlis = GlobalTimelines::get_all();
-        for tli in &tlis {
-            if !tli.is_active().await {
-                continue;
-            }
-            let ttid = tli.ttid;
-            async {
-                if let Err(e) = tli.maybe_persist_control_file().await {
-                    warn!("failed to persist control file: {e}");
-                }
-                if let Err(e) = tli.remove_old_wal(conf.wal_backup_enabled).await {
-                    error!("failed to remove WAL: {}", e);
-                }
-            }
-            .instrument(info_span!("WAL removal", ttid = %ttid))
-            .await;
-        }
-        sleep(wal_removal_interval).await;
+    let mut horizon_lsn = state.cfile_remote_consistent_lsn;
+    // we don't want to remove WAL that is not yet offloaded to s3
+    horizon_lsn = min(horizon_lsn, state.cfile_backup_lsn);
+    // Min by local commit_lsn to be able to begin reading WAL from somewhere on
+    // sk start. Technically we don't allow local commit_lsn to be higher than
+    // flush_lsn, but let's be double safe by including it as well.
+    horizon_lsn = min(horizon_lsn, state.cfile_commit_lsn);
+    horizon_lsn = min(horizon_lsn, state.flush_lsn);
+    if let Some(extra_horizon_lsn) = extra_horizon_lsn {
+        horizon_lsn = min(horizon_lsn, extra_horizon_lsn);
     }
+
+    horizon_lsn
 }
