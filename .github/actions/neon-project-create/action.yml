@@ -3,23 +3,48 @@ description: 'Create Neon Project using API'
 
 inputs:
   api_key:
-    desctiption: 'Neon API key'
+    description: 'Neon API key'
     required: true
   region_id:
-    desctiption: 'Region ID, if not set the project will be created in the default region'
+    description: 'Region ID, if not set the project will be created in the default region'
     default: aws-us-east-2
   postgres_version:
-    desctiption: 'Postgres version; default is 15'
-    default: 15
+    description: 'Postgres version; default is 16'
+    default: '16'
   api_host:
-    desctiption: 'Neon API host'
-    default: console.stage.neon.tech
-  provisioner:
-    desctiption: 'k8s-pod or k8s-neonvm'
-    default: 'k8s-pod'
+    description: 'Neon API host'
+    default: console-stage.neon.build
   compute_units:
-    desctiption: '[Min, Max] compute units; Min and Max are used for k8s-neonvm with autoscaling, for k8s-pod values Min and Max should be equal'
+    description: '[Min, Max] compute units'
     default: '[1, 1]'
+  # settings below only needed if you want the project to be sharded from the beginning
+  shard_split_project:
+    description: 'by default new projects are not shard-split, specify true to shard-split'
+    required: false
+    default: 'false'
+  admin_api_key:
+    description: 'Admin API Key needed for shard-splitting. Must be specified if shard_split_project is true'
+    required: false
+  shard_count:
+    description: 'Number of shards to split the project into, only applies if shard_split_project is true'
+    required: false
+    default: '8'
+  stripe_size:
+    description: 'Stripe size, optional, in 8kiB pages.  e.g. set 2048 for 16MB stripes. Default is 128 MiB, only applies if shard_split_project is true'
+    required: false
+    default: '32768'
+  psql_path:
+    description: 'Path to psql binary - it is caller responsibility to provision the psql binary'
+    required: false
+    default: '/tmp/neon/pg_install/v16/bin/psql'
+  libpq_lib_path:
+    description: 'Path to directory containing libpq library - it is caller responsibility to provision the libpq library'
+    required: false
+    default: '/tmp/neon/pg_install/v16/lib'
+  project_settings:
+    description: 'A JSON object with project settings'
+    required: false
+    default: '{}'
 
 outputs:
   dsn:
@@ -37,10 +62,6 @@ runs:
       # A shell without `set -x` to not to expose password/dsn in logs
       shell: bash -euo pipefail {0}
       run: |
-        if [ "${PROVISIONER}" == "k8s-pod" ] && [ "${MIN_CU}" != "${MAX_CU}" ]; then
-          echo >&2 "For k8s-pod provisioner MIN_CU should be equal to MAX_CU"
-        fi
-
         project=$(curl \
           "https://${API_HOST}/api/v2/projects" \
           --fail \
@@ -52,10 +73,10 @@ runs:
               \"name\": \"Created by actions/neon-project-create; GITHUB_RUN_ID=${GITHUB_RUN_ID}\",
               \"pg_version\": ${POSTGRES_VERSION},
               \"region_id\": \"${REGION_ID}\",
-              \"provisioner\": \"${PROVISIONER}\",
+              \"provisioner\": \"k8s-neonvm\",
               \"autoscaling_limit_min_cu\": ${MIN_CU},
               \"autoscaling_limit_max_cu\": ${MAX_CU},
-              \"settings\": { }
+              \"settings\": ${PROJECT_SETTINGS}
             }
           }")
 
@@ -70,11 +91,34 @@ runs:
         echo "project_id=${project_id}" >> $GITHUB_OUTPUT
 
         echo "Project ${project_id} has been created"
+
+        if [ "${SHARD_SPLIT_PROJECT}" = "true" ]; then
+          # determine tenant ID
+          TENANT_ID=`${PSQL} ${dsn} -t -A -c "SHOW neon.tenant_id"`
+
+          echo "Splitting project ${project_id} with tenant_id ${TENANT_ID} into $((SHARD_COUNT)) shards with stripe size $((STRIPE_SIZE))"
+
+          echo "Sending PUT request to https://${API_HOST}/regions/${REGION_ID}/api/v1/admin/storage/proxy/control/v1/tenant/${TENANT_ID}/shard_split"
+          echo "with body {\"new_shard_count\": $((SHARD_COUNT)), \"new_stripe_size\": $((STRIPE_SIZE))}"
+
+          # we need an ADMIN API KEY to invoke storage controller API for shard splitting (bash -u above checks that the variable is set)
+          curl -X PUT \
+            "https://${API_HOST}/regions/${REGION_ID}/api/v1/admin/storage/proxy/control/v1/tenant/${TENANT_ID}/shard_split" \
+            -H "Accept: application/json" -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_API_KEY}" \
+            -d "{\"new_shard_count\": $SHARD_COUNT, \"new_stripe_size\": $STRIPE_SIZE}"
+        fi
+
       env:
         API_HOST: ${{ inputs.api_host }}
         API_KEY: ${{ inputs.api_key }}
         REGION_ID: ${{ inputs.region_id }}
         POSTGRES_VERSION: ${{ inputs.postgres_version }}
-        PROVISIONER: ${{ inputs.provisioner }}
         MIN_CU: ${{ fromJSON(inputs.compute_units)[0] }}
         MAX_CU: ${{ fromJSON(inputs.compute_units)[1] }}
+        SHARD_SPLIT_PROJECT: ${{ inputs.shard_split_project }}
+        ADMIN_API_KEY: ${{ inputs.admin_api_key }}
+        SHARD_COUNT: ${{ inputs.shard_count }}
+        STRIPE_SIZE: ${{ inputs.stripe_size }}
+        PSQL: ${{ inputs.psql_path }}
+        LD_LIBRARY_PATH: ${{ inputs.libpq_lib_path }}
+        PROJECT_SETTINGS: ${{ inputs.project_settings }}

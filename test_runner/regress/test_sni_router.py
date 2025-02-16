@@ -1,13 +1,18 @@
+from __future__ import annotations
+
 import socket
 import subprocess
 from pathlib import Path
-from types import TracebackType
-from typing import Optional, Type
+from typing import TYPE_CHECKING
 
 import backoff
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import PgProtocol, VanillaPostgres
 from fixtures.port_distributor import PortDistributor
+
+if TYPE_CHECKING:
+    from types import TracebackType
+    from typing import Self
 
 
 def generate_tls_cert(cn, certout, keyout):
@@ -50,10 +55,10 @@ class PgSniRouter(PgProtocol):
         self.destination = destination
         self.tls_cert = tls_cert
         self.tls_key = tls_key
-        self._popen: Optional[subprocess.Popen[bytes]] = None
+        self._popen: subprocess.Popen[bytes] | None = None
         self.test_output_dir = test_output_dir
 
-    def start(self) -> "PgSniRouter":
+    def start(self) -> Self:
         assert self._popen is None
         args = [
             str(self.neon_binpath / "pg_sni_router"),
@@ -86,14 +91,14 @@ class PgSniRouter(PgProtocol):
         if self._popen:
             self._popen.wait(timeout=2)
 
-    def __enter__(self) -> "PgSniRouter":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ):
         if self._popen is not None:
             self._popen.terminate()
@@ -111,7 +116,7 @@ def test_pg_sni_router(
     test_output_dir: Path,
 ):
     generate_tls_cert(
-        "endpoint.namespace.localtest.me",
+        "endpoint.namespace.local.neon.build",
         test_output_dir / "router.crt",
         test_output_dir / "router.key",
     )
@@ -125,7 +130,7 @@ def test_pg_sni_router(
     with PgSniRouter(
         neon_binpath=neon_binpath,
         port=router_port,
-        destination="localtest.me",
+        destination="local.neon.build",
         tls_cert=test_output_dir / "router.crt",
         tls_key=test_output_dir / "router.key",
         test_output_dir=test_output_dir,
@@ -136,7 +141,7 @@ def test_pg_sni_router(
             "select 1",
             dbname="postgres",
             sslmode="require",
-            host=f"endpoint--namespace--{pg_port}.localtest.me",
+            host=f"endpoint--namespace--{pg_port}.local.neon.build",
             hostaddr="127.0.0.1",
         )
         assert out[0][0] == 1

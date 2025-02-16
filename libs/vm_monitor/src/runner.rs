@@ -12,7 +12,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cgroup::{self, CgroupWatcher};
 use crate::dispatcher::Dispatcher;
@@ -69,7 +69,7 @@ pub struct Config {
     /// should be removed once we have a better solution there.
     sys_buffer_bytes: u64,
 
-    /// Minimum fraction of total system memory reserved *before* the the cgroup threshold; in
+    /// Minimum fraction of total system memory reserved *before* the cgroup threshold; in
     /// other words, providing a ceiling for the highest value of the threshold by enforcing that
     /// there's at least `cgroup_min_overhead_fraction` of the total memory remaining beyond the
     /// threshold.
@@ -79,8 +79,7 @@ pub struct Config {
     /// memory.
     ///
     /// The default value of `0.15` means that we *guarantee* sending upscale requests if the
-    /// cgroup is using more than 85% of total memory (even if we're *not* separately reserving
-    /// memory for the file cache).
+    /// cgroup is using more than 85% of total memory.
     cgroup_min_overhead_fraction: f64,
 
     cgroup_downscale_threshold_buffer_bytes: u64,
@@ -97,24 +96,12 @@ impl Default for Config {
 }
 
 impl Config {
-    fn cgroup_threshold(&self, total_mem: u64, file_cache_disk_size: u64) -> u64 {
-        // If the file cache is in tmpfs, then it will count towards shmem usage of the cgroup,
-        // and thus be non-reclaimable, so we should allow for additional memory usage.
-        //
-        // If the file cache sits on disk, our desired stable system state is for it to be fully
-        // page cached (its contents should only be paged to/from disk in situations where we can't
-        // upscale fast enough). Page-cached memory is reclaimable, so we need to lower the
-        // threshold for non-reclaimable memory so we scale up *before* the kernel starts paging
-        // out the file cache.
-        let memory_remaining_for_cgroup = total_mem.saturating_sub(file_cache_disk_size);
-
-        // Even if we're not separately making room for the file cache (if it's in tmpfs), we still
-        // want our threshold to be met gracefully instead of letting postgres get OOM-killed.
+    fn cgroup_threshold(&self, total_mem: u64) -> u64 {
+        // We want our threshold to be met gracefully instead of letting postgres get OOM-killed
+        // (or if there's room, spilling to swap).
         // So we guarantee that there's at least `cgroup_min_overhead_fraction` of total memory
         // remaining above the threshold.
-        let max_threshold = (total_mem as f64 * (1.0 - self.cgroup_min_overhead_fraction)) as u64;
-
-        memory_remaining_for_cgroup.min(max_threshold)
+        (total_mem as f64 * (1.0 - self.cgroup_min_overhead_fraction)) as u64
     }
 }
 
@@ -149,11 +136,6 @@ impl Runner {
 
         let mem = get_total_system_memory();
 
-        let mut file_cache_disk_size = 0;
-
-        // We need to process file cache initialization before cgroup initialization, so that the memory
-        // allocated to the file cache is appropriately taken into account when we decide the cgroup's
-        // memory limits.
         if let Some(connstr) = &args.pgconnstr {
             info!("initializing file cache");
             let config = FileCacheConfig::default();
@@ -184,7 +166,6 @@ impl Runner {
                 info!("file cache size actually got set to {actual_size}")
             }
 
-            file_cache_disk_size = actual_size;
             state.filecache = Some(file_cache);
         }
 
@@ -207,7 +188,7 @@ impl Runner {
                 cgroup.watch(hist_tx).await
             });
 
-            let threshold = state.config.cgroup_threshold(mem, file_cache_disk_size);
+            let threshold = state.config.cgroup_threshold(mem);
             info!(threshold, "set initial cgroup threshold",);
 
             state.cgroup = Some(CgroupState {
@@ -259,9 +240,7 @@ impl Runner {
                 return Ok((false, status.to_owned()));
             }
 
-            let new_threshold = self
-                .config
-                .cgroup_threshold(usable_system_memory, expected_file_cache_size);
+            let new_threshold = self.config.cgroup_threshold(usable_system_memory);
 
             let current = last_history.avg_non_reclaimable;
 
@@ -282,13 +261,11 @@ impl Runner {
 
         // The downscaling has been approved. Downscale the file cache, then the cgroup.
         let mut status = vec![];
-        let mut file_cache_disk_size = 0;
         if let Some(file_cache) = &mut self.filecache {
             let actual_usage = file_cache
                 .set_file_cache_size(expected_file_cache_size)
                 .await
                 .context("failed to set file cache size")?;
-            file_cache_disk_size = actual_usage;
             let message = format!(
                 "set file cache size to {} MiB",
                 bytes_to_mebibytes(actual_usage),
@@ -298,9 +275,7 @@ impl Runner {
         }
 
         if let Some(cgroup) = &mut self.cgroup {
-            let new_threshold = self
-                .config
-                .cgroup_threshold(usable_system_memory, file_cache_disk_size);
+            let new_threshold = self.config.cgroup_threshold(usable_system_memory);
 
             let message = format!(
                 "set cgroup memory threshold from {} MiB to {} MiB, of new total {} MiB",
@@ -329,7 +304,6 @@ impl Runner {
         let new_mem = resources.mem;
         let usable_system_memory = new_mem.saturating_sub(self.config.sys_buffer_bytes);
 
-        let mut file_cache_disk_size = 0;
         if let Some(file_cache) = &mut self.filecache {
             let expected_usage = file_cache.config.calculate_cache_size(usable_system_memory);
             info!(
@@ -342,7 +316,6 @@ impl Runner {
                 .set_file_cache_size(expected_usage)
                 .await
                 .context("failed to set file cache size")?;
-            file_cache_disk_size = actual_usage;
 
             if actual_usage != expected_usage {
                 warn!(
@@ -354,9 +327,7 @@ impl Runner {
         }
 
         if let Some(cgroup) = &mut self.cgroup {
-            let new_threshold = self
-                .config
-                .cgroup_threshold(usable_system_memory, file_cache_disk_size);
+            let new_threshold = self.config.cgroup_threshold(usable_system_memory);
 
             info!(
                 "set cgroup memory threshold from {} MiB to {} MiB of new total {} MiB",
@@ -399,12 +370,16 @@ impl Runner {
                 }),
             InboundMsgKind::InvalidMessage { error } => {
                 warn!(
-                    %error, id, "received notification of an invalid message we sent"
+                    error = format_args!("{error:#}"),
+                    id, "received notification of an invalid message we sent"
                 );
                 Ok(None)
             }
             InboundMsgKind::InternalError { error } => {
-                warn!(error, id, "agent experienced an internal error");
+                warn!(
+                    error = format_args!("{error:#}"),
+                    id, "agent experienced an internal error"
+                );
                 Ok(None)
             }
             InboundMsgKind::HealthCheck {} => {
@@ -446,12 +421,11 @@ impl Runner {
                     if let Some(t) = self.last_upscale_request_at {
                         let elapsed = t.elapsed();
                         if elapsed < Duration::from_secs(1) {
-                            info!(
-                                elapsed_millis = elapsed.as_millis(),
-                                avg_non_reclaimable = bytes_to_mebibytes(cgroup_mem_stat.avg_non_reclaimable),
-                                threshold = bytes_to_mebibytes(cgroup.threshold),
-                                "cgroup memory stats are high enough to upscale but too soon to forward the request, ignoring",
-                            );
+                            // *Ideally* we'd like to log here that we're ignoring the fact the
+                            // memory stats are too high, but in practice this can result in
+                            // spamming the logs with repetitive messages about ignoring the signal
+                            //
+                            // See https://github.com/neondatabase/neon/issues/5865 for more.
                             continue;
                         }
                     }
@@ -475,25 +449,28 @@ impl Runner {
                 // there is a message from the agent
                 msg = self.dispatcher.source.next() => {
                     if let Some(msg) = msg {
-                        // Don't use 'message' as a key as the string also uses
-                        // that for its key
-                        info!(?msg, "received message");
-                        match msg {
+                        match &msg {
                             Ok(msg) => {
                                 let message: InboundMsg = match msg {
                                     Message::Text(text) => {
-                                        serde_json::from_str(&text).context("failed to deserialize text message")?
+                                        serde_json::from_str(text).context("failed to deserialize text message")?
                                     }
                                     other => {
                                         warn!(
                                             // Don't use 'message' as a key as the
                                             // string also uses that for its key
                                             msg = ?other,
-                                            "agent should only send text messages but received different type"
+                                            "problem processing incoming message: agent should only send text messages but received different type"
                                         );
                                         continue
                                     },
                                 };
+
+                                if matches!(&message.inner, InboundMsgKind::HealthCheck { .. }) {
+                                    debug!(?msg, "received message");
+                                } else {
+                                    info!(?msg, "received message");
+                                }
 
                                 let out = match self.process_message(message.clone()).await {
                                     Ok(Some(out)) => out,
@@ -503,7 +480,7 @@ impl Runner {
                                         // gives the outermost cause, and the debug impl
                                         // pretty-prints the error, whereas {:#} contains all the
                                         // causes, but is compact (no newlines).
-                                        warn!(error = format!("{e:#}"), "error handling message");
+                                        warn!(error = format_args!("{e:#}"), "error handling message");
                                         OutboundMsg::new(
                                             OutboundMsgKind::InternalError {
                                                 error: e.to_string(),
@@ -518,7 +495,11 @@ impl Runner {
                                     .await
                                     .context("failed to send message")?;
                             }
-                            Err(e) => warn!("{e}"),
+                            Err(e) => warn!(
+                                error = format_args!("{e:#}"),
+                                msg = ?msg,
+                                "received error message"
+                            ),
                         }
                     } else {
                         anyhow::bail!("dispatcher connection closed")

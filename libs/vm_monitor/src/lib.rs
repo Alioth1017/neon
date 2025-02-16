@@ -7,11 +7,13 @@ use axum::{
     extract::{ws::WebSocket, State, WebSocketUpgrade},
     response::Response,
 };
-use axum::{routing::get, Router, Server};
+use axum::{routing::get, Router};
 use clap::Parser;
 use futures::Future;
+use std::net::SocketAddr;
 use std::{fmt::Debug, time::Duration};
 use sysinfo::{RefreshKind, System, SystemExt};
+use tokio::net::TcpListener;
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -132,14 +134,14 @@ pub async fn start(args: &'static Args, token: CancellationToken) -> anyhow::Res
             args,
         });
 
-    let addr = args.addr();
-    let bound = Server::try_bind(&addr.parse().expect("parsing address should not fail"))
+    let addr_str = args.addr();
+    let addr: SocketAddr = addr_str.parse().expect("parsing address should not fail");
+
+    let listener = TcpListener::bind(&addr)
+        .await
         .with_context(|| format!("failed to bind to {addr}"))?;
-
-    info!(addr, "server bound");
-
-    bound
-        .serve(app.into_make_service())
+    info!(addr_str, "server bound");
+    axum::serve(listener, app.into_make_service())
         .await
         .context("server exited")?;
 
@@ -189,15 +191,12 @@ async fn start_monitor(
     .await;
     let mut monitor = match monitor {
         Ok(Ok(monitor)) => monitor,
-        Ok(Err(error)) => {
-            error!(?error, "failed to create monitor");
+        Ok(Err(e)) => {
+            error!(error = format_args!("{e:#}"), "failed to create monitor");
             return;
         }
         Err(_) => {
-            error!(
-                ?timeout,
-                "creating monitor timed out (probably waiting to receive protocol range)"
-            );
+            error!(?timeout, "creating monitor timed out");
             return;
         }
     };
@@ -205,6 +204,9 @@ async fn start_monitor(
 
     match monitor.run().await {
         Ok(()) => info!("monitor was killed due to new connection"),
-        Err(e) => error!(error = ?e, "monitor terminated unexpectedly"),
+        Err(e) => error!(
+            error = format_args!("{e:#}"),
+            "monitor terminated unexpectedly"
+        ),
     }
 }

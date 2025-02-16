@@ -63,22 +63,18 @@
 //! The contract between client and its user is that the user is responsible of
 //! scheduling operations in an order that keeps the remote consistent as
 //! described above.
+//!
 //! From the user's perspective, the operations are executed sequentially.
 //! Internally, the client knows which operations can be performed in parallel,
 //! and which operations act like a "barrier" that require preceding operations
 //! to finish. The calling code just needs to call the schedule-functions in the
 //! correct order, and the client will parallelize the operations in a way that
-//! is safe.
-//!
-//! The caller should be careful with deletion, though. They should not delete
-//! local files that have been scheduled for upload but not yet finished uploading.
-//! Otherwise the upload will fail. To wait for an upload to finish, use
-//! the 'wait_completion' function (more on that later.)
+//! is safe. For more details, see `UploadOp::can_bypass`.
 //!
 //! All of this relies on the following invariants:
 //!
 //! - We rely on read-after write consistency in the remote storage.
-//! - Layer files are immutable
+//! - Layer files are immutable.
 //!
 //! NB: Pageserver assumes that it has exclusive write access to the tenant in remote
 //! storage. Different tenants can be attached to different pageservers, but if the
@@ -91,8 +87,7 @@
 //!
 //! The *actual* remote state lags behind the *desired* remote state while
 //! there are in-flight operations.
-//! We keep track of the desired remote state in
-//! [`UploadQueueInitialized::latest_files`] and [`UploadQueueInitialized::latest_metadata`].
+//! We keep track of the desired remote state in [`UploadQueueInitialized::dirty`].
 //! It is initialized based on the [`IndexPart`] that was passed during init
 //! and updated with every `schedule_*` function call.
 //! All this is necessary necessary to compute the future [`IndexPart`]s
@@ -115,8 +110,7 @@
 //!
 //! # Completion
 //!
-//! Once an operation has completed, we update
-//! [`UploadQueueInitialized::projected_remote_consistent_lsn`] immediately,
+//! Once an operation has completed, we update [`UploadQueueInitialized::clean`] immediately,
 //! and submit a request through the DeletionQueue to update
 //! [`UploadQueueInitialized::visible_remote_consistent_lsn`] after it has
 //! validated that our generation is not stale.  It is this visible value
@@ -182,34 +176,40 @@
 
 pub(crate) mod download;
 pub mod index;
-mod upload;
+pub mod manifest;
+pub(crate) mod upload;
 
 use anyhow::Context;
 use camino::Utf8Path;
 use chrono::{NaiveDateTime, Utc};
 
 pub(crate) use download::download_initdb_tar_zst;
+use pageserver_api::models::TimelineArchivalState;
 use pageserver_api::shard::{ShardIndex, TenantShardId};
+use regex::Regex;
 use scopeguard::ScopeGuard;
 use tokio_util::sync::CancellationToken;
-pub(crate) use upload::upload_initdb_dir;
 use utils::backoff::{
     self, exponential_backoff, DEFAULT_BASE_BACKOFF_SECONDS, DEFAULT_MAX_BACKOFF_SECONDS,
 };
-use utils::timeout::{timeout_cancellable, TimeoutCancellableError};
+use utils::pausable_failpoint;
+use utils::shard::ShardNumber;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use remote_storage::{DownloadError, GenericRemoteStorage, RemotePath};
+use remote_storage::{
+    DownloadError, GenericRemoteStorage, ListingMode, RemotePath, TimeoutOrCancel,
+};
 use std::ops::DerefMut;
 use tracing::{debug, error, info, instrument, warn};
 use tracing::{info_span, Instrument};
 use utils::lsn::Lsn;
 
-use crate::deletion_queue::DeletionQueueClient;
+use crate::context::RequestContext;
+use crate::deletion_queue::{DeletionQueueClient, DeletionQueueError};
 use crate::metrics::{
     MeasureRemoteOp, RemoteOpFileKind, RemoteOpKind, RemoteTimelineClientMetrics,
     RemoteTimelineClientMetricsCallTrackSize, REMOTE_ONDEMAND_DOWNLOADED_BYTES,
@@ -217,8 +217,9 @@ use crate::metrics::{
 };
 use crate::task_mgr::shutdown_token;
 use crate::tenant::debug_assert_current_span_has_tenant_and_timeline_id;
+use crate::tenant::remote_timeline_client::download::download_retry;
 use crate::tenant::storage_layer::AsLayerDesc;
-use crate::tenant::upload_queue::Delete;
+use crate::tenant::upload_queue::{Delete, OpType, UploadQueueStoppedDeletable};
 use crate::tenant::TIMELINES_SEGMENT_NAME;
 use crate::{
     config::PageServerConf,
@@ -229,18 +230,26 @@ use crate::{
     tenant::upload_queue::{
         UploadOp, UploadQueue, UploadQueueInitialized, UploadQueueStopped, UploadTask,
     },
+    TENANT_HEATMAP_BASENAME,
 };
 
 use utils::id::{TenantId, TimelineId};
 
 use self::index::IndexPart;
 
-use super::storage_layer::{Layer, LayerFileName, ResidentLayer};
-use super::upload_queue::SetDeletedFlagProgress;
-use super::Generation;
+use super::config::AttachedLocationConfig;
+use super::metadata::MetadataUpdate;
+use super::storage_layer::{Layer, LayerName, ResidentLayer};
+use super::timeline::import_pgdata;
+use super::upload_queue::{NotInitialized, SetDeletedFlagProgress};
+use super::{DeleteTimelineError, Generation};
 
-pub(crate) use download::{is_temp_download_file, list_remote_timelines};
+pub(crate) use download::{
+    download_index_part, download_tenant_manifest, is_temp_download_file,
+    list_remote_tenant_shards, list_remote_timelines,
+};
 pub(crate) use index::LayerFileMetadata;
+pub(crate) use upload::upload_initdb_dir;
 
 // Occasional network issues and such can cause remote operations to fail, and
 // that's expected. If a download fails, we log it at info-level, and retry.
@@ -256,21 +265,18 @@ pub(crate) const FAILED_UPLOAD_WARN_THRESHOLD: u32 = 3;
 
 pub(crate) const INITDB_PATH: &str = "initdb.tar.zst";
 
+pub(crate) const INITDB_PRESERVED_PATH: &str = "initdb-preserved.tar.zst";
+
 /// Default buffer size when interfacing with [`tokio::fs::File`].
 pub(crate) const BUFFER_SIZE: usize = 32 * 1024;
+
+/// Doing non-essential flushes of deletion queue is subject to this timeout, after
+/// which we warn and skip.
+const DELETION_QUEUE_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub enum MaybeDeletedIndexPart {
     IndexPart(IndexPart),
     Deleted(IndexPart),
-}
-
-/// Errors that can arise when calling [`RemoteTimelineClient::stop`].
-#[derive(Debug, thiserror::Error)]
-pub enum StopError {
-    /// Returned if the upload queue was never initialized.
-    /// See [`RemoteTimelineClient::init_upload_queue`] and [`RemoteTimelineClient::init_upload_queue_for_empty_remote`].
-    #[error("queue is not initialized")]
-    QueueUninitialized,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -281,6 +287,57 @@ pub enum PersistIndexPartWithDeletedFlagError {
     AlreadyDeleted(NaiveDateTime),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WaitCompletionError {
+    #[error(transparent)]
+    NotInitialized(NotInitialized),
+    #[error("wait_completion aborted because upload queue was stopped")]
+    UploadQueueShutDownOrStopped,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Upload queue either in unexpected state or hasn't downloaded manifest yet")]
+pub struct UploadQueueNotReadyError;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShutdownIfArchivedError {
+    #[error(transparent)]
+    NotInitialized(NotInitialized),
+    #[error("timeline is not archived")]
+    NotArchived,
+}
+
+/// Behavioral modes that enable seamless live migration.
+///
+/// See docs/rfcs/028-pageserver-migration.md to understand how these fit in.
+struct RemoteTimelineClientConfig {
+    /// If this is false, then update to remote_consistent_lsn are dropped rather
+    /// than being submitted to DeletionQueue for validation.  This behavior is
+    /// used when a tenant attachment is known to have a stale generation number,
+    /// such that validation attempts will always fail.  This is not necessary
+    /// for correctness, but avoids spamming error statistics with failed validations
+    /// when doing migrations of tenants.
+    process_remote_consistent_lsn_updates: bool,
+
+    /// If this is true, then object deletions are held in a buffer in RemoteTimelineClient
+    /// rather than being submitted to the DeletionQueue.  This behavior is used when a tenant
+    /// is known to be multi-attached, in order to avoid disrupting other attached tenants
+    /// whose generations' metadata refers to the deleted objects.
+    block_deletions: bool,
+}
+
+/// RemoteTimelineClientConfig's state is entirely driven by LocationConf, but we do
+/// not carry the entire LocationConf structure: it's much more than we need.  The From
+/// impl extracts the subset of the LocationConf that is interesting to RemoteTimelineClient.
+impl From<&AttachedLocationConfig> for RemoteTimelineClientConfig {
+    fn from(lc: &AttachedLocationConfig) -> Self {
+        Self {
+            block_deletions: !lc.may_delete_layers_hint(),
+            process_remote_consistent_lsn_updates: lc.may_upload_layers_hint(),
+        }
+    }
 }
 
 /// A client for accessing a timeline's data in remote storage.
@@ -302,7 +359,7 @@ pub enum PersistIndexPartWithDeletedFlagError {
 /// in the index part file, whenever timeline metadata is uploaded.
 ///
 /// Downloads are not queued, they are performed immediately.
-pub struct RemoteTimelineClient {
+pub(crate) struct RemoteTimelineClient {
     conf: &'static PageServerConf,
 
     runtime: tokio::runtime::Handle,
@@ -313,51 +370,21 @@ pub struct RemoteTimelineClient {
 
     upload_queue: Mutex<UploadQueue>,
 
-    metrics: Arc<RemoteTimelineClientMetrics>,
+    pub(crate) metrics: Arc<RemoteTimelineClientMetrics>,
 
     storage_impl: GenericRemoteStorage,
 
     deletion_queue_client: DeletionQueueClient,
 
+    /// Subset of tenant configuration used to control upload behaviors during migrations
+    config: std::sync::RwLock<RemoteTimelineClientConfig>,
+
     cancel: CancellationToken,
 }
 
-/// This timeout is intended to deal with hangs in lower layers, e.g. stuck TCP flows.  It is not
-/// intended to be snappy enough for prompt shutdown, as we have a CancellationToken for that.
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Wrapper for timeout_cancellable that flattens result and converts TimeoutCancellableError to anyhow.
-///
-/// This is a convenience for the various upload functions.  In future
-/// the anyhow::Error result should be replaced with a more structured type that
-/// enables callers to avoid handling shutdown as an error.
-async fn upload_cancellable<F>(cancel: &CancellationToken, future: F) -> anyhow::Result<()>
-where
-    F: std::future::Future<Output = anyhow::Result<()>>,
-{
-    match timeout_cancellable(UPLOAD_TIMEOUT, cancel, future).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(TimeoutCancellableError::Timeout) => Err(anyhow::anyhow!("Timeout")),
-        Err(TimeoutCancellableError::Cancelled) => Err(anyhow::anyhow!("Shutting down")),
-    }
-}
-/// Wrapper for timeout_cancellable that flattens result and converts TimeoutCancellableError to DownloaDError.
-async fn download_cancellable<F, R>(
-    cancel: &CancellationToken,
-    future: F,
-) -> Result<R, DownloadError>
-where
-    F: std::future::Future<Output = Result<R, DownloadError>>,
-{
-    match timeout_cancellable(DOWNLOAD_TIMEOUT, cancel, future).await {
-        Ok(Ok(r)) => Ok(r),
-        Ok(Err(e)) => Err(e),
-        Err(TimeoutCancellableError::Timeout) => {
-            Err(DownloadError::Other(anyhow::anyhow!("Timed out")))
-        }
-        Err(TimeoutCancellableError::Cancelled) => Err(DownloadError::Cancelled),
+impl Drop for RemoteTimelineClient {
+    fn drop(&mut self) {
+        debug!("dropping RemoteTimelineClient");
     }
 }
 
@@ -368,13 +395,14 @@ impl RemoteTimelineClient {
     /// Note: the caller must initialize the upload queue before any uploads can be scheduled,
     /// by calling init_upload_queue.
     ///
-    pub fn new(
+    pub(crate) fn new(
         remote_storage: GenericRemoteStorage,
         deletion_queue_client: DeletionQueueClient,
         conf: &'static PageServerConf,
         tenant_shard_id: TenantShardId,
         timeline_id: TimelineId,
         generation: Generation,
+        location_conf: &AttachedLocationConfig,
     ) -> RemoteTimelineClient {
         RemoteTimelineClient {
             conf,
@@ -394,6 +422,7 @@ impl RemoteTimelineClient {
                 &tenant_shard_id,
                 &timeline_id,
             )),
+            config: std::sync::RwLock::new(RemoteTimelineClientConfig::from(location_conf)),
             cancel: CancellationToken::new(),
         }
     }
@@ -402,8 +431,15 @@ impl RemoteTimelineClient {
     /// an index file upload, i.e., it's not empty.
     /// The given `index_part` must be the one on the remote.
     pub fn init_upload_queue(&self, index_part: &IndexPart) -> anyhow::Result<()> {
+        // Set the maximum number of inprogress tasks to the remote storage concurrency. There's
+        // certainly no point in starting more upload tasks than this.
+        let inprogress_limit = self
+            .conf
+            .remote_storage_config
+            .as_ref()
+            .map_or(0, |r| r.concurrency_limit());
         let mut upload_queue = self.upload_queue.lock().unwrap();
-        upload_queue.initialize_with_current_remote_index_part(index_part)?;
+        upload_queue.initialize_with_current_remote_index_part(index_part, inprogress_limit)?;
         self.update_remote_physical_size_gauge(Some(index_part));
         info!(
             "initialized upload queue from remote index with {} layer files",
@@ -418,8 +454,15 @@ impl RemoteTimelineClient {
         &self,
         local_metadata: &TimelineMetadata,
     ) -> anyhow::Result<()> {
+        // Set the maximum number of inprogress tasks to the remote storage concurrency. There's
+        // certainly no point in starting more upload tasks than this.
+        let inprogress_limit = self
+            .conf
+            .remote_storage_config
+            .as_ref()
+            .map_or(0, |r| r.concurrency_limit());
         let mut upload_queue = self.upload_queue.lock().unwrap();
-        upload_queue.initialize_empty_remote(local_metadata)?;
+        upload_queue.initialize_empty_remote(local_metadata, inprogress_limit)?;
         self.update_remote_physical_size_gauge(None);
         info!("initialized upload queue as empty");
         Ok(())
@@ -435,16 +478,16 @@ impl RemoteTimelineClient {
         let deleted_at = index_part.deleted_at.ok_or(anyhow::anyhow!(
             "bug: it is responsibility of the caller to provide index part from MaybeDeletedIndexPart::Deleted"
         ))?;
-
-        {
-            let mut upload_queue = self.upload_queue.lock().unwrap();
-            upload_queue.initialize_with_current_remote_index_part(index_part)?;
-            self.update_remote_physical_size_gauge(Some(index_part));
-        }
-        // also locks upload queue, without dropping the guard above it will be a deadlock
-        self.stop().expect("initialized line above");
+        let inprogress_limit = self
+            .conf
+            .remote_storage_config
+            .as_ref()
+            .map_or(0, |r| r.concurrency_limit());
 
         let mut upload_queue = self.upload_queue.lock().unwrap();
+        upload_queue.initialize_with_current_remote_index_part(index_part, inprogress_limit)?;
+        self.update_remote_physical_size_gauge(Some(index_part));
+        self.stop_impl(&mut upload_queue);
 
         upload_queue
             .stopped_mut()
@@ -454,11 +497,50 @@ impl RemoteTimelineClient {
         Ok(())
     }
 
+    /// Notify this client of a change to its parent tenant's config, as this may cause us to
+    /// take action (unblocking deletions when transitioning from AttachedMulti to AttachedSingle)
+    pub(super) fn update_config(&self, location_conf: &AttachedLocationConfig) {
+        let new_conf = RemoteTimelineClientConfig::from(location_conf);
+        let unblocked = !new_conf.block_deletions;
+
+        // Update config before draining deletions, so that we don't race with more being
+        // inserted.  This can result in deletions happening our of order, but that does not
+        // violate any invariants: deletions only need to be ordered relative to upload of the index
+        // that dereferences the deleted objects, and we are not changing that order.
+        *self.config.write().unwrap() = new_conf;
+
+        if unblocked {
+            // If we may now delete layers, drain any that were blocked in our old
+            // configuration state
+            let mut queue_locked = self.upload_queue.lock().unwrap();
+
+            if let Ok(queue) = queue_locked.initialized_mut() {
+                let blocked_deletions = std::mem::take(&mut queue.blocked_deletions);
+                for d in blocked_deletions {
+                    if let Err(e) = self.deletion_queue_client.push_layers(
+                        self.tenant_shard_id,
+                        self.timeline_id,
+                        self.generation,
+                        d.layers,
+                    ) {
+                        // This could happen if the pageserver is shut down while a tenant
+                        // is transitioning from a deletion-blocked state: we will leak some
+                        // S3 objects in this case.
+                        warn!("Failed to drain blocked deletions: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns `None` if nothing is yet uplodaded, `Some(disk_consistent_lsn)` otherwise.
     pub fn remote_consistent_lsn_projected(&self) -> Option<Lsn> {
         match &mut *self.upload_queue.lock().unwrap() {
             UploadQueue::Uninitialized => None,
             UploadQueue::Initialized(q) => q.get_last_remote_consistent_lsn_projected(),
-            UploadQueue::Stopped(q) => q
+            UploadQueue::Stopped(UploadQueueStopped::Uninitialized) => None,
+            UploadQueue::Stopped(UploadQueueStopped::Deletable(q)) => q
                 .upload_queue_for_deletion
                 .get_last_remote_consistent_lsn_projected(),
         }
@@ -468,11 +550,48 @@ impl RemoteTimelineClient {
         match &mut *self.upload_queue.lock().unwrap() {
             UploadQueue::Uninitialized => None,
             UploadQueue::Initialized(q) => Some(q.get_last_remote_consistent_lsn_visible()),
-            UploadQueue::Stopped(q) => Some(
+            UploadQueue::Stopped(UploadQueueStopped::Uninitialized) => None,
+            UploadQueue::Stopped(UploadQueueStopped::Deletable(q)) => Some(
                 q.upload_queue_for_deletion
                     .get_last_remote_consistent_lsn_visible(),
             ),
         }
+    }
+
+    /// Returns true if this timeline was previously detached at this Lsn and the remote timeline
+    /// client is currently initialized.
+    pub(crate) fn is_previous_ancestor_lsn(&self, lsn: Lsn) -> bool {
+        self.upload_queue
+            .lock()
+            .unwrap()
+            .initialized_mut()
+            .map(|uq| uq.clean.0.lineage.is_previous_ancestor_lsn(lsn))
+            .unwrap_or(false)
+    }
+
+    /// Returns whether the timeline is archived.
+    /// Return None if the remote index_part hasn't been downloaded yet.
+    pub(crate) fn is_archived(&self) -> Option<bool> {
+        self.upload_queue
+            .lock()
+            .unwrap()
+            .initialized_mut()
+            .map(|q| q.clean.0.archived_at.is_some())
+            .ok()
+    }
+
+    /// Returns `Ok(Some(timestamp))` if the timeline has been archived, `Ok(None)` if the timeline hasn't been archived.
+    ///
+    /// Return Err(_) if the remote index_part hasn't been downloaded yet, or the timeline hasn't been stopped yet.
+    pub(crate) fn archived_at_stopped_queue(
+        &self,
+    ) -> Result<Option<NaiveDateTime>, UploadQueueNotReadyError> {
+        self.upload_queue
+            .lock()
+            .unwrap()
+            .stopped_mut()
+            .map(|q| q.upload_queue_for_deletion.clean.0.archived_at)
+            .map_err(|_| UploadQueueNotReadyError)
     }
 
     fn update_remote_physical_size_gauge(&self, current_remote_index_part: Option<&IndexPart>) {
@@ -480,17 +599,16 @@ impl RemoteTimelineClient {
             current_remote_index_part
                 .layer_metadata
                 .values()
-                // If we don't have the file size for the layer, don't account for it in the metric.
                 .map(|ilmd| ilmd.file_size)
                 .sum()
         } else {
             0
         };
-        self.metrics.remote_physical_size_set(size);
+        self.metrics.remote_physical_size_gauge.set(size);
     }
 
     pub fn get_remote_physical_size(&self) -> u64 {
-        self.metrics.remote_physical_size_get()
+        self.metrics.remote_physical_size_gauge.get()
     }
 
     //
@@ -503,7 +621,7 @@ impl RemoteTimelineClient {
     /// Download index file
     pub async fn download_index_file(
         &self,
-        cancel: CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<MaybeDeletedIndexPart, DownloadError> {
         let _unfinished_gauge_guard = self.metrics.call_begin(
             &RemoteOpFileKind::Index,
@@ -513,7 +631,7 @@ impl RemoteTimelineClient {
             },
         );
 
-        let index_part = download::download_index_part(
+        let (index_part, index_generation, index_last_modified) = download::download_index_part(
             &self.storage_impl,
             &self.tenant_shard_id,
             &self.timeline_id,
@@ -521,13 +639,60 @@ impl RemoteTimelineClient {
             cancel,
         )
         .measure_remote_op(
-            self.tenant_shard_id.tenant_id,
-            self.timeline_id,
             RemoteOpFileKind::Index,
             RemoteOpKind::Download,
             Arc::clone(&self.metrics),
         )
         .await?;
+
+        // Defense in depth: monotonicity of generation numbers is an important correctness guarantee, so when we see a very
+        // old index, we do extra checks in case this is the result of backward time-travel of the generation number (e.g.
+        // in case of a bug in the service that issues generation numbers). Indices are allowed to be old, but we expect that
+        // when we load an old index we are loading the _latest_ index: if we are asked to load an old index and there is
+        // also a newer index available, that is surprising.
+        const INDEX_AGE_CHECKS_THRESHOLD: Duration = Duration::from_secs(14 * 24 * 3600);
+        let index_age = index_last_modified.elapsed().unwrap_or_else(|e| {
+            if e.duration() > Duration::from_secs(5) {
+                // We only warn if the S3 clock and our local clock are >5s out: because this is a low resolution
+                // timestamp, it is common to be out by at least 1 second.
+                tracing::warn!("Index has modification time in the future: {e}");
+            }
+            Duration::ZERO
+        });
+        if index_age > INDEX_AGE_CHECKS_THRESHOLD {
+            tracing::info!(
+                ?index_generation,
+                age = index_age.as_secs_f64(),
+                "Loaded an old index, checking for other indices..."
+            );
+
+            // Find the highest-generation index
+            let (_latest_index_part, latest_index_generation, latest_index_mtime) =
+                download::download_index_part(
+                    &self.storage_impl,
+                    &self.tenant_shard_id,
+                    &self.timeline_id,
+                    Generation::MAX,
+                    cancel,
+                )
+                .await?;
+
+            if latest_index_generation > index_generation {
+                // Unexpected!  Why are we loading such an old index if a more recent one exists?
+                // We will refuse to proceed, as there is no reasonable scenario where this should happen, but
+                // there _is_ a clear bug/corruption scenario where it would happen (controller sets the generation
+                // backwards).
+                tracing::error!(
+                    ?index_generation,
+                    ?latest_index_generation,
+                    ?latest_index_mtime,
+                    "Found a newer index while loading an old one"
+                );
+                return Err(DownloadError::Fatal(
+                    "Index age exceeds threshold and a newer index exists".into(),
+                ));
+            }
+        }
 
         if index_part.deleted_at.is_some() {
             Ok(MaybeDeletedIndexPart::Deleted(index_part))
@@ -543,10 +708,13 @@ impl RemoteTimelineClient {
     /// On success, returns the size of the downloaded file.
     pub async fn download_layer_file(
         &self,
-        layer_file_name: &LayerFileName,
+        layer_file_name: &LayerName,
         layer_metadata: &LayerFileMetadata,
+        local_path: &Utf8Path,
+        gate: &utils::sync::gate::Gate,
         cancel: &CancellationToken,
-    ) -> anyhow::Result<u64> {
+        ctx: &RequestContext,
+    ) -> Result<u64, DownloadError> {
         let downloaded_size = {
             let _unfinished_gauge_guard = self.metrics.call_begin(
                 &RemoteOpFileKind::Layer,
@@ -562,11 +730,12 @@ impl RemoteTimelineClient {
                 self.timeline_id,
                 layer_file_name,
                 layer_metadata,
+                local_path,
+                gate,
                 cancel,
+                ctx,
             )
             .measure_remote_op(
-                self.tenant_shard_id.tenant_id,
-                self.timeline_id,
                 RemoteOpFileKind::Layer,
                 RemoteOpKind::Download,
                 Arc::clone(&self.metrics),
@@ -584,9 +753,10 @@ impl RemoteTimelineClient {
     // Upload operations.
     //
 
-    ///
     /// Launch an index-file upload operation in the background, with
-    /// updated metadata.
+    /// fully updated metadata.
+    ///
+    /// This should only be used to upload initial metadata to remote storage.
     ///
     /// The upload will be added to the queue immediately, but it
     /// won't be performed until all previously scheduled layer file
@@ -598,7 +768,7 @@ impl RemoteTimelineClient {
     /// If there were any changes to the list of files, i.e. if any
     /// layer file uploads were scheduled, since the last index file
     /// upload, those will be included too.
-    pub fn schedule_index_upload_for_metadata_update(
+    pub fn schedule_index_upload_for_full_metadata_update(
         self: &Arc<Self>,
         metadata: &TimelineMetadata,
     ) -> anyhow::Result<()> {
@@ -607,10 +777,139 @@ impl RemoteTimelineClient {
 
         // As documented in the struct definition, it's ok for latest_metadata to be
         // ahead of what's _actually_ on the remote during index upload.
-        upload_queue.latest_metadata = metadata.clone();
+        upload_queue.dirty.metadata = metadata.clone();
 
-        self.schedule_index_upload(upload_queue, upload_queue.latest_metadata.clone());
+        self.schedule_index_upload(upload_queue);
 
+        Ok(())
+    }
+
+    /// Launch an index-file upload operation in the background, with only parts of the metadata
+    /// updated.
+    ///
+    /// This is the regular way of updating metadata on layer flushes or Gc.
+    ///
+    /// Using this lighter update mechanism allows for reparenting and detaching without changes to
+    /// `index_part.json`, while being more clear on what values update regularly.
+    pub(crate) fn schedule_index_upload_for_metadata_update(
+        self: &Arc<Self>,
+        update: &MetadataUpdate,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.upload_queue.lock().unwrap();
+        let upload_queue = guard.initialized_mut()?;
+
+        upload_queue.dirty.metadata.apply(update);
+
+        // Defense in depth: if we somehow generated invalid metadata, do not persist it.
+        upload_queue
+            .dirty
+            .validate()
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        self.schedule_index_upload(upload_queue);
+
+        Ok(())
+    }
+
+    /// Launch an index-file upload operation in the background, with only the `archived_at` field updated.
+    ///
+    /// Returns whether it is required to wait for the queue to be empty to ensure that the change is uploaded,
+    /// so either if the change is already sitting in the queue, but not commited yet, or the change has not
+    /// been in the queue yet.
+    pub(crate) fn schedule_index_upload_for_timeline_archival_state(
+        self: &Arc<Self>,
+        state: TimelineArchivalState,
+    ) -> anyhow::Result<bool> {
+        let mut guard = self.upload_queue.lock().unwrap();
+        let upload_queue = guard.initialized_mut()?;
+
+        /// Returns Some(_) if a change is needed, and Some(true) if it's a
+        /// change needed to set archived_at.
+        fn need_change(
+            archived_at: &Option<NaiveDateTime>,
+            state: TimelineArchivalState,
+        ) -> Option<bool> {
+            match (archived_at, state) {
+                (Some(_), TimelineArchivalState::Archived)
+                | (None, TimelineArchivalState::Unarchived) => {
+                    // Nothing to do
+                    tracing::info!("intended state matches present state");
+                    None
+                }
+                (None, TimelineArchivalState::Archived) => Some(true),
+                (Some(_), TimelineArchivalState::Unarchived) => Some(false),
+            }
+        }
+        let need_upload_scheduled = need_change(&upload_queue.dirty.archived_at, state);
+
+        if let Some(archived_at_set) = need_upload_scheduled {
+            let intended_archived_at = archived_at_set.then(|| Utc::now().naive_utc());
+            upload_queue.dirty.archived_at = intended_archived_at;
+            self.schedule_index_upload(upload_queue);
+        }
+
+        let need_wait = need_change(&upload_queue.clean.0.archived_at, state).is_some();
+        Ok(need_wait)
+    }
+
+    /// Shuts the timeline client down, but only if the timeline is archived.
+    ///
+    /// This function and [`Self::schedule_index_upload_for_timeline_archival_state`] use the
+    /// same lock to prevent races between unarchival and offloading: unarchival requires the
+    /// upload queue to be initialized, and leaves behind an upload queue where either dirty
+    /// or clean has archived_at of `None`. offloading leaves behind an uninitialized upload
+    /// queue.
+    pub(crate) async fn shutdown_if_archived(
+        self: &Arc<Self>,
+    ) -> Result<(), ShutdownIfArchivedError> {
+        {
+            let mut guard = self.upload_queue.lock().unwrap();
+            let upload_queue = guard
+                .initialized_mut()
+                .map_err(ShutdownIfArchivedError::NotInitialized)?;
+
+            match (
+                upload_queue.dirty.archived_at.is_none(),
+                upload_queue.clean.0.archived_at.is_none(),
+            ) {
+                // The expected case: the timeline is archived and we don't want to unarchive
+                (false, false) => {}
+                (true, false) => {
+                    tracing::info!("can't shut down timeline: timeline slated for unarchival");
+                    return Err(ShutdownIfArchivedError::NotArchived);
+                }
+                (dirty_archived, true) => {
+                    tracing::info!(%dirty_archived, "can't shut down timeline: timeline not archived in remote storage");
+                    return Err(ShutdownIfArchivedError::NotArchived);
+                }
+            }
+
+            // Set the shutting_down flag while the guard from the archival check is held.
+            // This prevents a race with unarchival, as initialized_mut will not return
+            // an upload queue from this point.
+            // Also launch the queued tasks like shutdown() does.
+            if !upload_queue.shutting_down {
+                upload_queue.shutting_down = true;
+                upload_queue.queued_operations.push_back(UploadOp::Shutdown);
+                // this operation is not counted similar to Barrier
+                self.launch_queued_tasks(upload_queue);
+            }
+        }
+
+        self.shutdown().await;
+
+        Ok(())
+    }
+
+    /// Launch an index-file upload operation in the background, setting `import_pgdata` field.
+    pub(crate) fn schedule_index_upload_for_import_pgdata_state_update(
+        self: &Arc<Self>,
+        state: Option<import_pgdata::index_part_format::Root>,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.upload_queue.lock().unwrap();
+        let upload_queue = guard.initialized_mut()?;
+        upload_queue.dirty.import_pgdata = state;
+        self.schedule_index_upload(upload_queue);
         Ok(())
     }
 
@@ -624,38 +923,40 @@ impl RemoteTimelineClient {
     ///
     /// Like schedule_index_upload_for_metadata_update(), this merely adds
     /// the upload to the upload queue and returns quickly.
-    pub fn schedule_index_upload_for_file_changes(self: &Arc<Self>) -> anyhow::Result<()> {
+    pub fn schedule_index_upload_for_file_changes(self: &Arc<Self>) -> Result<(), NotInitialized> {
         let mut guard = self.upload_queue.lock().unwrap();
         let upload_queue = guard.initialized_mut()?;
 
         if upload_queue.latest_files_changes_since_metadata_upload_scheduled > 0 {
-            self.schedule_index_upload(upload_queue, upload_queue.latest_metadata.clone());
+            self.schedule_index_upload(upload_queue);
         }
 
         Ok(())
     }
 
     /// Launch an index-file upload operation in the background (internal function)
-    fn schedule_index_upload(
-        self: &Arc<Self>,
-        upload_queue: &mut UploadQueueInitialized,
-        metadata: TimelineMetadata,
-    ) {
+    fn schedule_index_upload(self: &Arc<Self>, upload_queue: &mut UploadQueueInitialized) {
+        let disk_consistent_lsn = upload_queue.dirty.metadata.disk_consistent_lsn();
+        // fix up the duplicated field
+        upload_queue.dirty.disk_consistent_lsn = disk_consistent_lsn;
+
+        // make sure it serializes before doing it in perform_upload_task so that it doesn't
+        // look like a retryable error
+        let void = std::io::sink();
+        serde_json::to_writer(void, &upload_queue.dirty).expect("serialize index_part.json");
+
+        let index_part = &upload_queue.dirty;
+
         info!(
-            "scheduling metadata upload with {} files ({} changed)",
-            upload_queue.latest_files.len(),
+            "scheduling metadata upload up to consistent LSN {disk_consistent_lsn} with {} files ({} changed)",
+            index_part.layer_metadata.len(),
             upload_queue.latest_files_changes_since_metadata_upload_scheduled,
         );
 
-        let disk_consistent_lsn = upload_queue.latest_metadata.disk_consistent_lsn();
-
-        let index_part = IndexPart::new(
-            upload_queue.latest_files.clone(),
-            disk_consistent_lsn,
-            metadata,
-        );
-        let op = UploadOp::UploadMetadata(index_part, disk_consistent_lsn);
-        self.calls_unfinished_metric_begin(&op);
+        let op = UploadOp::UploadMetadata {
+            uploaded: Box::new(index_part.clone()),
+        };
+        self.metric_begin(&op);
         upload_queue.queued_operations.push_back(op);
         upload_queue.latest_files_changes_since_metadata_upload_scheduled = 0;
 
@@ -663,13 +964,200 @@ impl RemoteTimelineClient {
         self.launch_queued_tasks(upload_queue);
     }
 
+    /// Reparent this timeline to a new parent.
     ///
-    /// Launch an upload operation in the background.
+    /// A retryable step of timeline ancestor detach.
+    pub(crate) async fn schedule_reparenting_and_wait(
+        self: &Arc<Self>,
+        new_parent: &TimelineId,
+    ) -> anyhow::Result<()> {
+        let receiver = {
+            let mut guard = self.upload_queue.lock().unwrap();
+            let upload_queue = guard.initialized_mut()?;
+
+            let Some(prev) = upload_queue.dirty.metadata.ancestor_timeline() else {
+                return Err(anyhow::anyhow!(
+                    "cannot reparent without a current ancestor"
+                ));
+            };
+
+            let uploaded = &upload_queue.clean.0.metadata;
+
+            if uploaded.ancestor_timeline().is_none() && !uploaded.ancestor_lsn().is_valid() {
+                // nothing to do
+                None
+            } else {
+                upload_queue.dirty.metadata.reparent(new_parent);
+                upload_queue.dirty.lineage.record_previous_ancestor(&prev);
+
+                self.schedule_index_upload(upload_queue);
+
+                Some(self.schedule_barrier0(upload_queue))
+            }
+        };
+
+        if let Some(receiver) = receiver {
+            Self::wait_completion0(receiver).await?;
+        }
+        Ok(())
+    }
+
+    /// Schedules uploading a new version of `index_part.json` with the given layers added,
+    /// detaching from ancestor and waits for it to complete.
     ///
+    /// This is used with `Timeline::detach_ancestor` functionality.
+    pub(crate) async fn schedule_adding_existing_layers_to_index_detach_and_wait(
+        self: &Arc<Self>,
+        layers: &[Layer],
+        adopted: (TimelineId, Lsn),
+    ) -> anyhow::Result<()> {
+        let barrier = {
+            let mut guard = self.upload_queue.lock().unwrap();
+            let upload_queue = guard.initialized_mut()?;
+
+            if upload_queue.clean.0.lineage.detached_previous_ancestor() == Some(adopted) {
+                None
+            } else {
+                upload_queue.dirty.metadata.detach_from_ancestor(&adopted);
+                upload_queue.dirty.lineage.record_detaching(&adopted);
+
+                for layer in layers {
+                    let prev = upload_queue
+                        .dirty
+                        .layer_metadata
+                        .insert(layer.layer_desc().layer_name(), layer.metadata());
+                    assert!(prev.is_none(), "copied layer existed already {layer}");
+                }
+
+                self.schedule_index_upload(upload_queue);
+
+                Some(self.schedule_barrier0(upload_queue))
+            }
+        };
+
+        if let Some(barrier) = barrier {
+            Self::wait_completion0(barrier).await?;
+        }
+        Ok(())
+    }
+
+    /// Adds a gc blocking reason for this timeline if one does not exist already.
+    ///
+    /// A retryable step of timeline detach ancestor.
+    ///
+    /// Returns a future which waits until the completion of the upload.
+    pub(crate) fn schedule_insert_gc_block_reason(
+        self: &Arc<Self>,
+        reason: index::GcBlockingReason,
+    ) -> Result<impl std::future::Future<Output = Result<(), WaitCompletionError>>, NotInitialized>
+    {
+        let maybe_barrier = {
+            let mut guard = self.upload_queue.lock().unwrap();
+            let upload_queue = guard.initialized_mut()?;
+
+            if let index::GcBlockingReason::DetachAncestor = reason {
+                if upload_queue.dirty.metadata.ancestor_timeline().is_none() {
+                    drop(guard);
+                    panic!("cannot start detach ancestor if there is nothing to detach from");
+                }
+            }
+
+            let wanted = |x: Option<&index::GcBlocking>| x.is_some_and(|x| x.blocked_by(reason));
+
+            let current = upload_queue.dirty.gc_blocking.as_ref();
+            let uploaded = upload_queue.clean.0.gc_blocking.as_ref();
+
+            match (current, uploaded) {
+                (x, y) if wanted(x) && wanted(y) => None,
+                (x, y) if wanted(x) && !wanted(y) => Some(self.schedule_barrier0(upload_queue)),
+                // Usual case: !wanted(x) && !wanted(y)
+                //
+                // Unusual: !wanted(x) && wanted(y) which means we have two processes waiting to
+                // turn on and off some reason.
+                (x, y) => {
+                    if !wanted(x) && wanted(y) {
+                        // this could be avoided by having external in-memory synchronization, like
+                        // timeline detach ancestor
+                        warn!(?reason, op="insert", "unexpected: two racing processes to enable and disable a gc blocking reason");
+                    }
+
+                    // at this point, the metadata must always show that there is a parent
+                    upload_queue.dirty.gc_blocking = current
+                        .map(|x| x.with_reason(reason))
+                        .or_else(|| Some(index::GcBlocking::started_now_for(reason)));
+                    self.schedule_index_upload(upload_queue);
+                    Some(self.schedule_barrier0(upload_queue))
+                }
+            }
+        };
+
+        Ok(async move {
+            if let Some(barrier) = maybe_barrier {
+                Self::wait_completion0(barrier).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Removes a gc blocking reason for this timeline if one exists.
+    ///
+    /// A retryable step of timeline detach ancestor.
+    ///
+    /// Returns a future which waits until the completion of the upload.
+    pub(crate) fn schedule_remove_gc_block_reason(
+        self: &Arc<Self>,
+        reason: index::GcBlockingReason,
+    ) -> Result<impl std::future::Future<Output = Result<(), WaitCompletionError>>, NotInitialized>
+    {
+        let maybe_barrier = {
+            let mut guard = self.upload_queue.lock().unwrap();
+            let upload_queue = guard.initialized_mut()?;
+
+            if let index::GcBlockingReason::DetachAncestor = reason {
+                if !upload_queue.clean.0.lineage.is_detached_from_ancestor() {
+                    drop(guard);
+                    panic!("cannot complete timeline_ancestor_detach while not detached");
+                }
+            }
+
+            let wanted = |x: Option<&index::GcBlocking>| {
+                x.is_none() || x.is_some_and(|b| !b.blocked_by(reason))
+            };
+
+            let current = upload_queue.dirty.gc_blocking.as_ref();
+            let uploaded = upload_queue.clean.0.gc_blocking.as_ref();
+
+            match (current, uploaded) {
+                (x, y) if wanted(x) && wanted(y) => None,
+                (x, y) if wanted(x) && !wanted(y) => Some(self.schedule_barrier0(upload_queue)),
+                (x, y) => {
+                    if !wanted(x) && wanted(y) {
+                        warn!(?reason, op="remove", "unexpected: two racing processes to enable and disable a gc blocking reason (remove)");
+                    }
+
+                    upload_queue.dirty.gc_blocking =
+                        current.as_ref().and_then(|x| x.without_reason(reason));
+                    assert!(wanted(upload_queue.dirty.gc_blocking.as_ref()));
+                    self.schedule_index_upload(upload_queue);
+                    Some(self.schedule_barrier0(upload_queue))
+                }
+            }
+        };
+
+        Ok(async move {
+            if let Some(barrier) = maybe_barrier {
+                Self::wait_completion0(barrier).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Launch an upload operation in the background; the file is added to be included in next
+    /// `index_part.json` upload.
     pub(crate) fn schedule_layer_file_upload(
         self: &Arc<Self>,
         layer: ResidentLayer,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), NotInitialized> {
         let mut guard = self.upload_queue.lock().unwrap();
         let upload_queue = guard.initialized_mut()?;
 
@@ -686,13 +1174,19 @@ impl RemoteTimelineClient {
         let metadata = layer.metadata();
 
         upload_queue
-            .latest_files
-            .insert(layer.layer_desc().filename(), metadata.clone());
+            .dirty
+            .layer_metadata
+            .insert(layer.layer_desc().layer_name(), metadata.clone());
         upload_queue.latest_files_changes_since_metadata_upload_scheduled += 1;
 
-        info!("scheduled layer file upload {layer}");
-        let op = UploadOp::UploadLayer(layer, metadata);
-        self.calls_unfinished_metric_begin(&op);
+        info!(
+            gen=?metadata.generation,
+            shard=?metadata.shard,
+            "scheduled layer file upload {layer}",
+        );
+
+        let op = UploadOp::UploadLayer(layer, metadata, None);
+        self.metric_begin(&op);
         upload_queue.queued_operations.push_back(op);
     }
 
@@ -706,7 +1200,7 @@ impl RemoteTimelineClient {
     /// successfully.
     pub fn schedule_layer_file_deletion(
         self: &Arc<Self>,
-        names: &[LayerFileName],
+        names: &[LayerName],
     ) -> anyhow::Result<()> {
         let mut guard = self.upload_queue.lock().unwrap();
         let upload_queue = guard.initialized_mut()?;
@@ -726,7 +1220,10 @@ impl RemoteTimelineClient {
     ///
     /// The files will be leaked in remote storage unless [`Self::schedule_deletion_of_unlinked`]
     /// is invoked on them.
-    pub(crate) fn schedule_gc_update(self: &Arc<Self>, gc_layers: &[Layer]) -> anyhow::Result<()> {
+    pub(crate) fn schedule_gc_update(
+        self: &Arc<Self>,
+        gc_layers: &[Layer],
+    ) -> Result<(), NotInitialized> {
         let mut guard = self.upload_queue.lock().unwrap();
         let upload_queue = guard.initialized_mut()?;
 
@@ -734,7 +1231,7 @@ impl RemoteTimelineClient {
         // the layer files as "dangling". this is fine, at worst case we create work for the
         // scrubber.
 
-        let names = gc_layers.iter().map(|x| x.layer_desc().filename());
+        let names = gc_layers.iter().map(|x| x.layer_desc().layer_name());
 
         self.schedule_unlinking_of_layers_from_index_part0(upload_queue, names);
 
@@ -749,21 +1246,17 @@ impl RemoteTimelineClient {
         self: &Arc<Self>,
         upload_queue: &mut UploadQueueInitialized,
         names: I,
-    ) -> Vec<(LayerFileName, LayerFileMetadata)>
+    ) -> Vec<(LayerName, LayerFileMetadata)>
     where
-        I: IntoIterator<Item = LayerFileName>,
+        I: IntoIterator<Item = LayerName>,
     {
-        // Deleting layers doesn't affect the values stored in TimelineMetadata,
-        // so we don't need update it. Just serialize it.
-        let metadata = upload_queue.latest_metadata.clone();
-
         // Decorate our list of names with each name's metadata, dropping
         // names that are unexpectedly missing from our metadata.  This metadata
         // is later used when physically deleting layers, to construct key paths.
         let with_metadata: Vec<_> = names
             .into_iter()
             .filter_map(|name| {
-                let meta = upload_queue.latest_files.remove(&name);
+                let meta = upload_queue.dirty.layer_metadata.remove(&name);
 
                 if let Some(meta) = meta {
                     upload_queue.latest_files_changes_since_metadata_upload_scheduled += 1;
@@ -795,7 +1288,7 @@ impl RemoteTimelineClient {
         // index_part update, because that needs to be uploaded before we can actually delete the
         // files.
         if upload_queue.latest_files_changes_since_metadata_upload_scheduled > 0 {
-            self.schedule_index_upload(upload_queue, metadata);
+            self.schedule_index_upload(upload_queue);
         }
 
         with_metadata
@@ -805,7 +1298,7 @@ impl RemoteTimelineClient {
     /// `index_part.json` with [`Self::schedule_gc_update`] or [`Self::schedule_compaction_update`].
     pub(crate) fn schedule_deletion_of_unlinked(
         self: &Arc<Self>,
-        layers: Vec<(LayerFileName, LayerFileMetadata)>,
+        layers: Vec<(LayerName, LayerFileMetadata)>,
     ) -> anyhow::Result<()> {
         let mut guard = self.upload_queue.lock().unwrap();
         let upload_queue = guard.initialized_mut()?;
@@ -818,8 +1311,25 @@ impl RemoteTimelineClient {
     fn schedule_deletion_of_unlinked0(
         self: &Arc<Self>,
         upload_queue: &mut UploadQueueInitialized,
-        with_metadata: Vec<(LayerFileName, LayerFileMetadata)>,
+        mut with_metadata: Vec<(LayerName, LayerFileMetadata)>,
     ) {
+        // Filter out any layers which were not created by this tenant shard.  These are
+        // layers that originate from some ancestor shard after a split, and may still
+        // be referenced by other shards. We are free to delete them locally and remove
+        // them from our index (and would have already done so when we reach this point
+        // in the code), but we may not delete them remotely.
+        with_metadata.retain(|(name, meta)| {
+            let retain = meta.shard.shard_number == self.tenant_shard_id.shard_number
+                && meta.shard.shard_count == self.tenant_shard_id.shard_count;
+            if !retain {
+                tracing::debug!(
+                    "Skipping deletion of ancestor-shard layer {name}, from shard {}",
+                    meta.shard
+                );
+            }
+            retain
+        });
+
         for (name, meta) in &with_metadata {
             info!(
                 "scheduling deletion of layer {}{} (shard {})",
@@ -844,10 +1354,14 @@ impl RemoteTimelineClient {
         }
 
         // schedule the actual deletions
+        if with_metadata.is_empty() {
+            // avoid scheduling the op & bumping the metric
+            return;
+        }
         let op = UploadOp::Delete(Delete {
             layers: with_metadata,
         });
-        self.calls_unfinished_metric_begin(&op);
+        self.metric_begin(&op);
         upload_queue.queued_operations.push_back(op);
     }
 
@@ -858,7 +1372,7 @@ impl RemoteTimelineClient {
         self: &Arc<Self>,
         compacted_from: &[Layer],
         compacted_to: &[ResidentLayer],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), NotInitialized> {
         let mut guard = self.upload_queue.lock().unwrap();
         let upload_queue = guard.initialized_mut()?;
 
@@ -866,7 +1380,7 @@ impl RemoteTimelineClient {
             self.schedule_layer_file_upload0(upload_queue, layer.clone());
         }
 
-        let names = compacted_from.iter().map(|x| x.layer_desc().filename());
+        let names = compacted_from.iter().map(|x| x.layer_desc().layer_name());
 
         self.schedule_unlinking_of_layers_from_index_part0(upload_queue, names);
         self.launch_queued_tasks(upload_queue);
@@ -875,15 +1389,23 @@ impl RemoteTimelineClient {
     }
 
     /// Wait for all previously scheduled uploads/deletions to complete
-    pub(crate) async fn wait_completion(self: &Arc<Self>) -> anyhow::Result<()> {
-        let mut receiver = {
+    pub(crate) async fn wait_completion(self: &Arc<Self>) -> Result<(), WaitCompletionError> {
+        let receiver = {
             let mut guard = self.upload_queue.lock().unwrap();
-            let upload_queue = guard.initialized_mut()?;
+            let upload_queue = guard
+                .initialized_mut()
+                .map_err(WaitCompletionError::NotInitialized)?;
             self.schedule_barrier0(upload_queue)
         };
 
+        Self::wait_completion0(receiver).await
+    }
+
+    async fn wait_completion0(
+        mut receiver: tokio::sync::watch::Receiver<()>,
+    ) -> Result<(), WaitCompletionError> {
         if receiver.changed().await.is_err() {
-            anyhow::bail!("wait_completion aborted because upload queue was stopped");
+            return Err(WaitCompletionError::UploadQueueShutDownOrStopped);
         }
 
         Ok(())
@@ -915,7 +1437,7 @@ impl RemoteTimelineClient {
     /// Wait for all previously scheduled operations to complete, and then stop.
     ///
     /// Not cancellation safe
-    pub(crate) async fn shutdown(self: &Arc<Self>) -> Result<(), StopError> {
+    pub(crate) async fn shutdown(self: &Arc<Self>) {
         // On cancellation the queue is left in ackward state of refusing new operations but
         // proper stop is yet to be called. On cancel the original or some later task must call
         // `stop` or `shutdown`.
@@ -926,8 +1448,16 @@ impl RemoteTimelineClient {
         let fut = {
             let mut guard = self.upload_queue.lock().unwrap();
             let upload_queue = match &mut *guard {
-                UploadQueue::Stopped(_) => return Ok(()),
-                UploadQueue::Uninitialized => return Err(StopError::QueueUninitialized),
+                UploadQueue::Stopped(_) => {
+                    scopeguard::ScopeGuard::into_inner(sg);
+                    return;
+                }
+                UploadQueue::Uninitialized => {
+                    // transition into Stopped state
+                    self.stop_impl(&mut guard);
+                    scopeguard::ScopeGuard::into_inner(sg);
+                    return;
+                }
                 UploadQueue::Initialized(ref mut init) => init,
             };
 
@@ -959,7 +1489,7 @@ impl RemoteTimelineClient {
             }
         }
 
-        self.stop()
+        self.stop();
     }
 
     /// Set the deleted_at field in the remote index file.
@@ -993,8 +1523,7 @@ impl RemoteTimelineClient {
             let deleted_at = Utc::now().naive_utc();
             stopped.deleted_at = SetDeletedFlagProgress::InProgress(deleted_at);
 
-            let mut index_part = IndexPart::try_from(&stopped.upload_queue_for_deletion)
-                .context("IndexPart serialize")?;
+            let mut index_part = stopped.upload_queue_for_deletion.dirty.clone();
             index_part.deleted_at = Some(deleted_at);
             index_part
         };
@@ -1027,9 +1556,11 @@ impl RemoteTimelineClient {
             // when executed as part of tenant deletion this happens in the background
             2,
             "persist_index_part_with_deleted_flag",
-            backoff::Cancel::new(self.cancel.clone(), || anyhow::anyhow!("Cancelled")),
+            &self.cancel,
         )
-        .await?;
+        .await
+        .ok_or_else(|| anyhow::Error::new(TimeoutOrCancel::Cancel))
+        .and_then(|x| x)?;
 
         // all good, disarm the guard and mark as success
         ScopeGuard::into_inner(undo_deleted_at);
@@ -1049,26 +1580,177 @@ impl RemoteTimelineClient {
         Ok(())
     }
 
+    pub(crate) fn is_deleting(&self) -> bool {
+        let mut locked = self.upload_queue.lock().unwrap();
+        locked.stopped_mut().is_ok()
+    }
+
+    pub(crate) async fn preserve_initdb_archive(
+        self: &Arc<Self>,
+        tenant_id: &TenantId,
+        timeline_id: &TimelineId,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        backoff::retry(
+            || async {
+                upload::preserve_initdb_archive(&self.storage_impl, tenant_id, timeline_id, cancel)
+                    .await
+            },
+            TimeoutOrCancel::caused_by_cancel,
+            FAILED_DOWNLOAD_WARN_THRESHOLD,
+            FAILED_REMOTE_OP_RETRIES,
+            "preserve_initdb_tar_zst",
+            &cancel.clone(),
+        )
+        .await
+        .ok_or_else(|| anyhow::Error::new(TimeoutOrCancel::Cancel))
+        .and_then(|x| x)
+        .context("backing up initdb archive")?;
+        Ok(())
+    }
+
+    /// Uploads the given layer **without** adding it to be part of a future `index_part.json` upload.
+    ///
+    /// This is not normally needed.
+    pub(crate) async fn upload_layer_file(
+        self: &Arc<Self>,
+        uploaded: &ResidentLayer,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let remote_path = remote_layer_path(
+            &self.tenant_shard_id.tenant_id,
+            &self.timeline_id,
+            uploaded.metadata().shard,
+            &uploaded.layer_desc().layer_name(),
+            uploaded.metadata().generation,
+        );
+
+        backoff::retry(
+            || async {
+                upload::upload_timeline_layer(
+                    &self.storage_impl,
+                    uploaded.local_path(),
+                    &remote_path,
+                    uploaded.metadata().file_size,
+                    cancel,
+                )
+                .await
+            },
+            TimeoutOrCancel::caused_by_cancel,
+            FAILED_UPLOAD_WARN_THRESHOLD,
+            FAILED_REMOTE_OP_RETRIES,
+            "upload a layer without adding it to latest files",
+            cancel,
+        )
+        .await
+        .ok_or_else(|| anyhow::Error::new(TimeoutOrCancel::Cancel))
+        .and_then(|x| x)
+        .context("upload a layer without adding it to latest files")
+    }
+
+    /// Copies the `adopted` remote existing layer to the remote path of `adopted_as`. The layer is
+    /// not added to be part of a future `index_part.json` upload.
+    pub(crate) async fn copy_timeline_layer(
+        self: &Arc<Self>,
+        adopted: &Layer,
+        adopted_as: &Layer,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let source_remote_path = remote_layer_path(
+            &self.tenant_shard_id.tenant_id,
+            &adopted
+                .get_timeline_id()
+                .expect("Source timeline should be alive"),
+            adopted.metadata().shard,
+            &adopted.layer_desc().layer_name(),
+            adopted.metadata().generation,
+        );
+
+        let target_remote_path = remote_layer_path(
+            &self.tenant_shard_id.tenant_id,
+            &self.timeline_id,
+            adopted_as.metadata().shard,
+            &adopted_as.layer_desc().layer_name(),
+            adopted_as.metadata().generation,
+        );
+
+        backoff::retry(
+            || async {
+                upload::copy_timeline_layer(
+                    &self.storage_impl,
+                    &source_remote_path,
+                    &target_remote_path,
+                    cancel,
+                )
+                .await
+            },
+            TimeoutOrCancel::caused_by_cancel,
+            FAILED_UPLOAD_WARN_THRESHOLD,
+            FAILED_REMOTE_OP_RETRIES,
+            "copy timeline layer",
+            cancel,
+        )
+        .await
+        .ok_or_else(|| anyhow::Error::new(TimeoutOrCancel::Cancel))
+        .and_then(|x| x)
+        .context("remote copy timeline layer")
+    }
+
+    async fn flush_deletion_queue(&self) -> Result<(), DeletionQueueError> {
+        match tokio::time::timeout(
+            DELETION_QUEUE_FLUSH_TIMEOUT,
+            self.deletion_queue_client.flush_immediate(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_timeout) => {
+                // Flushing remote deletions is not mandatory: we flush here to make the system easier to test, and
+                // to ensure that _usually_ objects are really gone after a DELETE is acked.  However, in case of deletion
+                // queue issues (https://github.com/neondatabase/neon/issues/6440), we don't want to wait indefinitely here.
+                tracing::warn!(
+                    "Timed out waiting for deletion queue flush, acking deletion anyway"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Prerequisites: UploadQueue should be in stopped state and deleted_at should be successfuly set.
     /// The function deletes layer files one by one, then lists the prefix to see if we leaked something
     /// deletes leaked files if any and proceeds with deletion of index file at the end.
-    pub(crate) async fn delete_all(self: &Arc<Self>) -> anyhow::Result<()> {
+    pub(crate) async fn delete_all(self: &Arc<Self>) -> Result<(), DeleteTimelineError> {
         debug_assert_current_span_has_tenant_and_timeline_id();
 
         let layers: Vec<RemotePath> = {
             let mut locked = self.upload_queue.lock().unwrap();
-            let stopped = locked.stopped_mut()?;
+            let stopped = locked.stopped_mut().map_err(DeleteTimelineError::Other)?;
 
             if !matches!(stopped.deleted_at, SetDeletedFlagProgress::Successful(_)) {
-                anyhow::bail!("deleted_at is not set")
+                return Err(DeleteTimelineError::Other(anyhow::anyhow!(
+                    "deleted_at is not set"
+                )));
             }
 
             debug_assert!(stopped.upload_queue_for_deletion.no_pending_work());
 
             stopped
                 .upload_queue_for_deletion
-                .latest_files
+                .dirty
+                .layer_metadata
                 .drain()
+                .filter(|(_file_name, meta)| {
+                    // Filter out layers that belonged to an ancestor shard.  Since we are deleting the whole timeline from
+                    // all shards anyway, we _could_ delete these, but
+                    // - it creates a potential race if other shards are still
+                    //   using the layers while this shard deletes them.
+                    // - it means that if we rolled back the shard split, the ancestor shards would be in a state where
+                    //   these timelines are present but corrupt (their index exists but some layers don't)
+                    //
+                    // These layers will eventually be cleaned up by the scrubber when it does physical GC.
+                    meta.shard.shard_number == self.tenant_shard_id.shard_number
+                        && meta.shard.shard_count == self.tenant_shard_id.shard_count
+                })
                 .map(|(file_name, meta)| {
                     remote_layer_path(
                         &self.tenant_shard_id.tenant_id,
@@ -1082,41 +1764,61 @@ impl RemoteTimelineClient {
         };
 
         let layer_deletion_count = layers.len();
-        self.deletion_queue_client.push_immediate(layers).await?;
+        self.deletion_queue_client
+            .push_immediate(layers)
+            .await
+            .map_err(|_| DeleteTimelineError::Cancelled)?;
+
+        // Delete the initdb.tar.zst, which is not always present, but deletion attempts of
+        // inexistant objects are not considered errors.
+        let initdb_path =
+            remote_initdb_archive_path(&self.tenant_shard_id.tenant_id, &self.timeline_id);
+        self.deletion_queue_client
+            .push_immediate(vec![initdb_path])
+            .await
+            .map_err(|_| DeleteTimelineError::Cancelled)?;
 
         // Do not delete index part yet, it is needed for possible retry. If we remove it first
         // and retry will arrive to different pageserver there wont be any traces of it on remote storage
         let timeline_storage_path = remote_timeline_path(&self.tenant_shard_id, &self.timeline_id);
 
-        // Execute all pending deletions, so that when we proceed to do a list_prefixes below, we aren't
+        // Execute all pending deletions, so that when we proceed to do a listing below, we aren't
         // taking the burden of listing all the layers that we already know we should delete.
-        self.deletion_queue_client.flush_immediate().await?;
+        self.flush_deletion_queue()
+            .await
+            .map_err(|_| DeleteTimelineError::Cancelled)?;
 
-        let remaining = backoff::retry(
+        let cancel = shutdown_token();
+
+        let remaining = download_retry(
             || async {
                 self.storage_impl
-                    .list_files(Some(&timeline_storage_path))
+                    .list(
+                        Some(&timeline_storage_path),
+                        ListingMode::NoDelimiter,
+                        None,
+                        &cancel,
+                    )
                     .await
             },
-            |_e| false,
-            FAILED_DOWNLOAD_WARN_THRESHOLD,
-            FAILED_REMOTE_OP_RETRIES,
-            "list_prefixes",
-            backoff::Cancel::new(shutdown_token(), || anyhow::anyhow!("Cancelled!")),
+            "list remaining files",
+            &cancel,
         )
         .await
-        .context("list prefixes")?;
+        .context("list files remaining files")?
+        .keys;
 
         // We will delete the current index_part object last, since it acts as a deletion
         // marker via its deleted_at attribute
         let latest_index = remaining
             .iter()
-            .filter(|p| {
-                p.object_name()
+            .filter(|o| {
+                o.key
+                    .object_name()
                     .map(|n| n.starts_with(IndexPart::FILE_NAME))
                     .unwrap_or(false)
             })
-            .filter_map(|path| parse_remote_index_path(path.clone()).map(|gen| (path, gen)))
+            .filter_map(|o| parse_remote_index_path(o.key.clone()).map(|gen| (o.key.clone(), gen)))
             .max_by_key(|i| i.1)
             .map(|i| i.0.clone())
             .unwrap_or(
@@ -1127,16 +1829,12 @@ impl RemoteTimelineClient {
 
         let remaining_layers: Vec<RemotePath> = remaining
             .into_iter()
-            .filter(|p| {
-                if p == &latest_index {
-                    return false;
+            .filter_map(|o| {
+                if o.key == latest_index || o.key.object_name() == Some(INITDB_PRESERVED_PATH) {
+                    None
+                } else {
+                    Some(o.key)
                 }
-                if let Some(name) = p.object_name() {
-                    if name == INITDB_PATH {
-                        return false;
-                    }
-                }
-                true
             })
             .inspect(|path| {
                 if let Some(name) = path.object_name() {
@@ -1151,28 +1849,32 @@ impl RemoteTimelineClient {
         if !remaining_layers.is_empty() {
             self.deletion_queue_client
                 .push_immediate(remaining_layers)
-                .await?;
+                .await
+                .map_err(|_| DeleteTimelineError::Cancelled)?;
         }
 
         fail::fail_point!("timeline-delete-before-index-delete", |_| {
-            Err(anyhow::anyhow!(
+            Err(DeleteTimelineError::Other(anyhow::anyhow!(
                 "failpoint: timeline-delete-before-index-delete"
-            ))?
+            )))?
         });
 
         debug!("enqueuing index part deletion");
         self.deletion_queue_client
             .push_immediate([latest_index].to_vec())
-            .await?;
+            .await
+            .map_err(|_| DeleteTimelineError::Cancelled)?;
 
         // Timeline deletion is rare and we have probably emitted a reasonably number of objects: wait
         // for a flush to a persistent deletion list so that we may be sure deletion will occur.
-        self.deletion_queue_client.flush_immediate().await?;
+        self.flush_deletion_queue()
+            .await
+            .map_err(|_| DeleteTimelineError::Cancelled)?;
 
         fail::fail_point!("timeline-delete-after-index-delete", |_| {
-            Err(anyhow::anyhow!(
+            Err(DeleteTimelineError::Other(anyhow::anyhow!(
                 "failpoint: timeline-delete-after-index-delete"
-            ))?
+            )))?
         });
 
         info!(prefix=%timeline_storage_path, referenced=layer_deletion_count, not_referenced=%not_referenced_count, "done deleting in timeline prefix, including index_part.json");
@@ -1180,66 +1882,35 @@ impl RemoteTimelineClient {
         Ok(())
     }
 
-    ///
     /// Pick next tasks from the queue, and start as many of them as possible without violating
     /// the ordering constraints.
     ///
-    /// The caller needs to already hold the `upload_queue` lock.
+    /// TODO: consider limiting the number of in-progress tasks, beyond what remote_storage does.
+    /// This can launch an unbounded number of queued tasks. `UploadQueue::next_ready()` also has
+    /// worst-case quadratic cost in the number of tasks, and may struggle beyond 10,000 tasks.
     fn launch_queued_tasks(self: &Arc<Self>, upload_queue: &mut UploadQueueInitialized) {
-        while let Some(next_op) = upload_queue.queued_operations.front() {
-            // Can we run this task now?
-            let can_run_now = match next_op {
-                UploadOp::UploadLayer(_, _) => {
-                    // Can always be scheduled.
-                    true
-                }
-                UploadOp::UploadMetadata(_, _) => {
-                    // These can only be performed after all the preceding operations
-                    // have finished.
-                    upload_queue.inprogress_tasks.is_empty()
-                }
-                UploadOp::Delete(_) => {
-                    // Wait for preceding uploads to finish. Concurrent deletions are OK, though.
-                    upload_queue.num_inprogress_deletions == upload_queue.inprogress_tasks.len()
-                }
+        while let Some((mut next_op, coalesced_ops)) = upload_queue.next_ready() {
+            debug!("starting op: {next_op}");
 
-                UploadOp::Barrier(_) | UploadOp::Shutdown => {
-                    upload_queue.inprogress_tasks.is_empty()
+            // Prepare upload.
+            match &mut next_op {
+                UploadOp::UploadLayer(layer, meta, mode) => {
+                    if upload_queue
+                        .recently_deleted
+                        .remove(&(layer.layer_desc().layer_name().clone(), meta.generation))
+                    {
+                        *mode = Some(OpType::FlushDeletion);
+                    } else {
+                        *mode = Some(OpType::MayReorder)
+                    }
                 }
-            };
-
-            // If we cannot launch this task, don't look any further.
-            //
-            // In some cases, we could let some non-frontmost tasks to "jump the queue" and launch
-            // them now, but we don't try to do that currently.  For example, if the frontmost task
-            // is an index-file upload that cannot proceed until preceding uploads have finished, we
-            // could still start layer uploads that were scheduled later.
-            if !can_run_now {
-                break;
-            }
-
-            if let UploadOp::Shutdown = next_op {
-                // leave the op in the queue but do not start more tasks; it will be dropped when
-                // the stop is called.
-                upload_queue.shutdown_ready.close();
-                break;
-            }
-
-            // We can launch this task. Remove it from the queue first.
-            let next_op = upload_queue.queued_operations.pop_front().unwrap();
-
-            debug!("starting op: {}", next_op);
-
-            // Update the counters
-            match next_op {
-                UploadOp::UploadLayer(_, _) => {
-                    upload_queue.num_inprogress_layer_uploads += 1;
-                }
-                UploadOp::UploadMetadata(_, _) => {
-                    upload_queue.num_inprogress_metadata_uploads += 1;
-                }
-                UploadOp::Delete(_) => {
-                    upload_queue.num_inprogress_deletions += 1;
+                UploadOp::UploadMetadata { .. } => {}
+                UploadOp::Delete(Delete { layers }) => {
+                    for (name, meta) in layers {
+                        upload_queue
+                            .recently_deleted
+                            .insert((name.clone(), meta.generation));
+                    }
                 }
                 UploadOp::Barrier(sender) => {
                     sender.send_replace(());
@@ -1256,6 +1927,7 @@ impl RemoteTimelineClient {
             let task = Arc::new(UploadTask {
                 task_id: upload_task_id,
                 op: next_op,
+                coalesced_ops,
                 retries: AtomicU32::new(0),
             });
             upload_queue
@@ -1269,10 +1941,9 @@ impl RemoteTimelineClient {
             task_mgr::spawn(
                 &self.runtime,
                 TaskKind::RemoteUploadTask,
-                Some(self.tenant_shard_id),
+                self.tenant_shard_id,
                 Some(self.timeline_id),
                 "remote upload",
-                false,
                 async move {
                     self_rc.perform_upload_task(task).await;
                     Ok(())
@@ -1296,6 +1967,7 @@ impl RemoteTimelineClient {
     /// queue.
     ///
     async fn perform_upload_task(self: &Arc<Self>, task: Arc<UploadTask>) {
+        let cancel = shutdown_token();
         // Loop to retry until it completes.
         loop {
             // If we're requested to shut down, close up shop and exit.
@@ -1307,83 +1979,180 @@ impl RemoteTimelineClient {
             // the Future, but we're not 100% sure if the remote storage library
             // is cancellation safe, so we don't dare to do that. Hopefully, the
             // upload finishes or times out soon enough.
-            if task_mgr::is_shutdown_requested() {
+            if cancel.is_cancelled() {
                 info!("upload task cancelled by shutdown request");
-                match self.stop() {
-                    Ok(()) => {}
-                    Err(StopError::QueueUninitialized) => {
-                        unreachable!("we never launch an upload task if the queue is uninitialized, and once it is initialized, we never go back")
-                    }
-                }
+                self.stop();
                 return;
             }
 
+            // Assert that we don't modify a layer that's referenced by the current index.
+            if cfg!(debug_assertions) {
+                let modified = match &task.op {
+                    UploadOp::UploadLayer(layer, layer_metadata, _) => {
+                        vec![(layer.layer_desc().layer_name(), layer_metadata)]
+                    }
+                    UploadOp::Delete(delete) => {
+                        delete.layers.iter().map(|(n, m)| (n.clone(), m)).collect()
+                    }
+                    // These don't modify layers.
+                    UploadOp::UploadMetadata { .. } => Vec::new(),
+                    UploadOp::Barrier(_) => Vec::new(),
+                    UploadOp::Shutdown => Vec::new(),
+                };
+                if let Ok(queue) = self.upload_queue.lock().unwrap().initialized_mut() {
+                    for (ref name, metadata) in modified {
+                        debug_assert!(
+                            !queue.clean.0.references(name, metadata),
+                            "layer {name} modified while referenced by index",
+                        );
+                    }
+                }
+            }
+
             let upload_result: anyhow::Result<()> = match &task.op {
-                UploadOp::UploadLayer(ref layer, ref layer_metadata) => {
-                    let path = layer.local_path();
+                UploadOp::UploadLayer(ref layer, ref layer_metadata, mode) => {
+                    // TODO: check if this mechanism can be removed now that can_bypass() performs
+                    // conflict checks during scheduling.
+                    if let Some(OpType::FlushDeletion) = mode {
+                        if self.config.read().unwrap().block_deletions {
+                            // Of course, this is not efficient... but usually the queue should be empty.
+                            let mut queue_locked = self.upload_queue.lock().unwrap();
+                            let mut detected = false;
+                            if let Ok(queue) = queue_locked.initialized_mut() {
+                                for list in queue.blocked_deletions.iter_mut() {
+                                    list.layers.retain(|(name, meta)| {
+                                        if name == &layer.layer_desc().layer_name()
+                                            && meta.generation == layer_metadata.generation
+                                        {
+                                            detected = true;
+                                            // remove the layer from deletion queue
+                                            false
+                                        } else {
+                                            // keep the layer
+                                            true
+                                        }
+                                    });
+                                }
+                            }
+                            if detected {
+                                info!(
+                                    "cancelled blocked deletion of layer {} at gen {:?}",
+                                    layer.layer_desc().layer_name(),
+                                    layer_metadata.generation
+                                );
+                            }
+                        } else {
+                            // TODO: we did not guarantee that upload task starts after deletion task, so there could be possibly race conditions
+                            // that we still get the layer deleted. But this only happens if someone creates a layer immediately after it's deleted,
+                            // which is not possible in the current system.
+                            info!(
+                                "waiting for deletion queue flush to complete before uploading layer {} at gen {:?}",
+                                layer.layer_desc().layer_name(),
+                                layer_metadata.generation
+                            );
+                            {
+                                // We are going to flush, we can clean up the recently deleted list.
+                                let mut queue_locked = self.upload_queue.lock().unwrap();
+                                if let Ok(queue) = queue_locked.initialized_mut() {
+                                    queue.recently_deleted.clear();
+                                }
+                            }
+                            if let Err(e) = self.deletion_queue_client.flush_execute().await {
+                                warn!(
+                                    "failed to flush the deletion queue before uploading layer {} at gen {:?}, still proceeding to upload: {e:#} ",
+                                    layer.layer_desc().layer_name(),
+                                    layer_metadata.generation
+                                );
+                            } else {
+                                info!(
+                                    "done flushing deletion queue before uploading layer {} at gen {:?}",
+                                    layer.layer_desc().layer_name(),
+                                    layer_metadata.generation
+                                );
+                            }
+                        }
+                    }
+                    let local_path = layer.local_path();
+
+                    // We should only be uploading layers created by this `Tenant`'s lifetime, so
+                    // the metadata in the upload should always match our current generation.
+                    assert_eq!(layer_metadata.generation, self.generation);
+
+                    let remote_path = remote_layer_path(
+                        &self.tenant_shard_id.tenant_id,
+                        &self.timeline_id,
+                        layer_metadata.shard,
+                        &layer.layer_desc().layer_name(),
+                        layer_metadata.generation,
+                    );
+
                     upload::upload_timeline_layer(
-                        self.conf,
                         &self.storage_impl,
-                        path,
-                        layer_metadata,
-                        self.generation,
+                        local_path,
+                        &remote_path,
+                        layer_metadata.file_size,
                         &self.cancel,
                     )
                     .measure_remote_op(
-                        self.tenant_shard_id.tenant_id,
-                        self.timeline_id,
                         RemoteOpFileKind::Layer,
                         RemoteOpKind::Upload,
                         Arc::clone(&self.metrics),
                     )
                     .await
                 }
-                UploadOp::UploadMetadata(ref index_part, _lsn) => {
-                    let mention_having_future_layers = if cfg!(feature = "testing") {
-                        index_part
-                            .layer_metadata
-                            .keys()
-                            .any(|x| x.is_in_future(*_lsn))
-                    } else {
-                        false
-                    };
-
+                UploadOp::UploadMetadata { ref uploaded } => {
                     let res = upload::upload_index_part(
                         &self.storage_impl,
                         &self.tenant_shard_id,
                         &self.timeline_id,
                         self.generation,
-                        index_part,
+                        uploaded,
                         &self.cancel,
                     )
                     .measure_remote_op(
-                        self.tenant_shard_id.tenant_id,
-                        self.timeline_id,
                         RemoteOpFileKind::Index,
                         RemoteOpKind::Upload,
                         Arc::clone(&self.metrics),
                     )
                     .await;
                     if res.is_ok() {
-                        self.update_remote_physical_size_gauge(Some(index_part));
+                        self.update_remote_physical_size_gauge(Some(uploaded));
+                        let mention_having_future_layers = if cfg!(feature = "testing") {
+                            uploaded
+                                .layer_metadata
+                                .keys()
+                                .any(|x| x.is_in_future(uploaded.metadata.disk_consistent_lsn()))
+                        } else {
+                            false
+                        };
                         if mention_having_future_layers {
                             // find rationale near crate::tenant::timeline::init::cleanup_future_layer
-                            tracing::info!(disk_consistent_lsn=%_lsn, "uploaded an index_part.json with future layers -- this is ok! if shutdown now, expect future layer cleanup");
+                            tracing::info!(
+                                disk_consistent_lsn = %uploaded.metadata.disk_consistent_lsn(),
+                                "uploaded an index_part.json with future layers -- this is ok! if shutdown now, expect future layer cleanup"
+                            );
                         }
                     }
                     res
                 }
                 UploadOp::Delete(delete) => {
-                    pausable_failpoint!("before-delete-layer-pausable");
-                    self.deletion_queue_client
-                        .push_layers(
-                            self.tenant_shard_id,
-                            self.timeline_id,
-                            self.generation,
-                            delete.layers.clone(),
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))
+                    if self.config.read().unwrap().block_deletions {
+                        let mut queue_locked = self.upload_queue.lock().unwrap();
+                        if let Ok(queue) = queue_locked.initialized_mut() {
+                            queue.blocked_deletions.push(delete.clone());
+                        }
+                        Ok(())
+                    } else {
+                        pausable_failpoint!("before-delete-layer-pausable");
+                        self.deletion_queue_client
+                            .push_layers(
+                                self.tenant_shard_id,
+                                self.timeline_id,
+                                self.generation,
+                                delete.layers.clone(),
+                            )
+                            .map_err(|e| anyhow::anyhow!(e))
+                    }
                 }
                 unexpected @ UploadOp::Barrier(_) | unexpected @ UploadOp::Shutdown => {
                     // unreachable. Barrier operations are handled synchronously in
@@ -1396,6 +2165,10 @@ impl RemoteTimelineClient {
             match upload_result {
                 Ok(()) => {
                     break;
+                }
+                Err(e) if TimeoutOrCancel::caused_by_cancel(&e) => {
+                    // loop around to do the proper stopping
+                    continue;
                 }
                 Err(e) => {
                     let retries = task.retries.fetch_add(1, Ordering::SeqCst);
@@ -1422,7 +2195,7 @@ impl RemoteTimelineClient {
                         retries,
                         DEFAULT_BASE_BACKOFF_SECONDS,
                         DEFAULT_MAX_BACKOFF_SECONDS,
-                        &shutdown_token(),
+                        &cancel,
                     )
                     .await;
                 }
@@ -1461,27 +2234,42 @@ impl RemoteTimelineClient {
             upload_queue.inprogress_tasks.remove(&task.task_id);
 
             let lsn_update = match task.op {
-                UploadOp::UploadLayer(_, _) => {
-                    upload_queue.num_inprogress_layer_uploads -= 1;
-                    None
-                }
-                UploadOp::UploadMetadata(_, lsn) => {
-                    upload_queue.num_inprogress_metadata_uploads -= 1;
-                    // XXX monotonicity check?
+                UploadOp::UploadLayer(_, _, _) => None,
+                UploadOp::UploadMetadata { ref uploaded } => {
+                    // the task id is reused as a monotonicity check for storing the "clean"
+                    // IndexPart.
+                    let last_updater = upload_queue.clean.1;
+                    let is_later = last_updater.is_some_and(|task_id| task_id < task.task_id);
+                    let monotone = is_later || last_updater.is_none();
 
-                    upload_queue.projected_remote_consistent_lsn = Some(lsn);
+                    assert!(monotone, "no two index uploads should be completing at the same time, prev={last_updater:?}, task.task_id={}", task.task_id);
+
+                    // not taking ownership is wasteful
+                    upload_queue.clean.0.clone_from(uploaded);
+                    upload_queue.clean.1 = Some(task.task_id);
+
+                    let lsn = upload_queue.clean.0.metadata.disk_consistent_lsn();
+                    self.metrics
+                        .projected_remote_consistent_lsn_gauge
+                        .set(lsn.0);
+
                     if self.generation.is_none() {
                         // Legacy mode: skip validating generation
                         upload_queue.visible_remote_consistent_lsn.store(lsn);
                         None
-                    } else {
+                    } else if self
+                        .config
+                        .read()
+                        .unwrap()
+                        .process_remote_consistent_lsn_updates
+                    {
                         Some((lsn, upload_queue.visible_remote_consistent_lsn.clone()))
+                    } else {
+                        // Our config disables remote_consistent_lsn updates: drop it.
+                        None
                     }
                 }
-                UploadOp::Delete(_) => {
-                    upload_queue.num_inprogress_deletions -= 1;
-                    None
-                }
+                UploadOp::Delete(_) => None,
                 UploadOp::Barrier(..) | UploadOp::Shutdown => unreachable!(),
             };
 
@@ -1505,10 +2293,13 @@ impl RemoteTimelineClient {
                 .await;
         }
 
-        self.calls_unfinished_metric_end(&task.op);
+        self.metric_end(&task.op);
+        for coalesced_op in &task.coalesced_ops {
+            self.metric_end(coalesced_op);
+        }
     }
 
-    fn calls_unfinished_metric_impl(
+    fn metric_impl(
         &self,
         op: &UploadOp,
     ) -> Option<(
@@ -1518,12 +2309,12 @@ impl RemoteTimelineClient {
     )> {
         use RemoteTimelineClientMetricsCallTrackSize::DontTrackSize;
         let res = match op {
-            UploadOp::UploadLayer(_, m) => (
+            UploadOp::UploadLayer(_, m, _) => (
                 RemoteOpFileKind::Layer,
                 RemoteOpKind::Upload,
-                RemoteTimelineClientMetricsCallTrackSize::Bytes(m.file_size()),
+                RemoteTimelineClientMetricsCallTrackSize::Bytes(m.file_size),
             ),
-            UploadOp::UploadMetadata(_, _) => (
+            UploadOp::UploadMetadata { .. } => (
                 RemoteOpFileKind::Index,
                 RemoteOpKind::Upload,
                 DontTrackSize {
@@ -1545,17 +2336,17 @@ impl RemoteTimelineClient {
         Some(res)
     }
 
-    fn calls_unfinished_metric_begin(&self, op: &UploadOp) {
-        let (file_kind, op_kind, track_bytes) = match self.calls_unfinished_metric_impl(op) {
+    fn metric_begin(&self, op: &UploadOp) {
+        let (file_kind, op_kind, track_bytes) = match self.metric_impl(op) {
             Some(x) => x,
             None => return,
         };
         let guard = self.metrics.call_begin(&file_kind, &op_kind, track_bytes);
-        guard.will_decrement_manually(); // in unfinished_ops_metric_end()
+        guard.will_decrement_manually(); // in metric_end(), see right below
     }
 
-    fn calls_unfinished_metric_end(&self, op: &UploadOp) {
-        let (file_kind, op_kind, track_bytes) = match self.calls_unfinished_metric_impl(op) {
+    fn metric_end(&self, op: &UploadOp) {
+        let (file_kind, op_kind, track_bytes) = match self.metric_impl(op) {
             Some(x) => x,
             None => return,
         };
@@ -1567,19 +2358,25 @@ impl RemoteTimelineClient {
     /// Use [`RemoteTimelineClient::shutdown`] for graceful stop.
     ///
     /// In-progress operations will still be running after this function returns.
-    /// Use `task_mgr::shutdown_tasks(None, Some(self.tenant_id), Some(timeline_id))`
+    /// Use `task_mgr::shutdown_tasks(Some(TaskKind::RemoteUploadTask), Some(self.tenant_shard_id), Some(timeline_id))`
     /// to wait for them to complete, after calling this function.
-    pub(crate) fn stop(&self) -> Result<(), StopError> {
+    pub(crate) fn stop(&self) {
         // Whichever *task* for this RemoteTimelineClient grabs the mutex first will transition the queue
         // into stopped state, thereby dropping all off the queued *ops* which haven't become *tasks* yet.
         // The other *tasks* will come here and observe an already shut down queue and hence simply wrap up their business.
         let mut guard = self.upload_queue.lock().unwrap();
-        match &mut *guard {
-            UploadQueue::Uninitialized => Err(StopError::QueueUninitialized),
+        self.stop_impl(&mut guard);
+    }
+
+    fn stop_impl(&self, guard: &mut std::sync::MutexGuard<UploadQueue>) {
+        match &mut **guard {
+            UploadQueue::Uninitialized => {
+                info!("UploadQueue is in state Uninitialized, nothing to do");
+                **guard = UploadQueue::Stopped(UploadQueueStopped::Uninitialized);
+            }
             UploadQueue::Stopped(_) => {
                 // nothing to do
                 info!("another concurrent task already shut down the queue");
-                Ok(())
             }
             UploadQueue::Initialized(initialized) => {
                 info!("shutting down upload queue");
@@ -1592,31 +2389,32 @@ impl RemoteTimelineClient {
                     // but for this use case it doesnt really makes sense to bring unsafe code only for this usage point.
                     // Deletion is not really perf sensitive so there shouldnt be any problems with cloning a fraction of it.
                     let upload_queue_for_deletion = UploadQueueInitialized {
+                        inprogress_limit: initialized.inprogress_limit,
                         task_counter: 0,
-                        latest_files: initialized.latest_files.clone(),
+                        dirty: initialized.dirty.clone(),
+                        clean: initialized.clean.clone(),
                         latest_files_changes_since_metadata_upload_scheduled: 0,
-                        latest_metadata: initialized.latest_metadata.clone(),
-                        projected_remote_consistent_lsn: None,
                         visible_remote_consistent_lsn: initialized
                             .visible_remote_consistent_lsn
                             .clone(),
-                        num_inprogress_layer_uploads: 0,
-                        num_inprogress_metadata_uploads: 0,
-                        num_inprogress_deletions: 0,
                         inprogress_tasks: HashMap::default(),
                         queued_operations: VecDeque::default(),
                         #[cfg(feature = "testing")]
                         dangling_files: HashMap::default(),
+                        blocked_deletions: Vec::new(),
                         shutting_down: false,
                         shutdown_ready: Arc::new(tokio::sync::Semaphore::new(0)),
+                        recently_deleted: HashSet::new(),
                     };
 
                     let upload_queue = std::mem::replace(
-                        &mut *guard,
-                        UploadQueue::Stopped(UploadQueueStopped {
-                            upload_queue_for_deletion,
-                            deleted_at: SetDeletedFlagProgress::NotRunning,
-                        }),
+                        &mut **guard,
+                        UploadQueue::Stopped(UploadQueueStopped::Deletable(
+                            UploadQueueStoppedDeletable {
+                                upload_queue_for_deletion,
+                                deleted_at: SetDeletedFlagProgress::NotRunning,
+                            },
+                        )),
                     );
                     if let UploadQueue::Initialized(qi) = upload_queue {
                         qi
@@ -1625,14 +2423,6 @@ impl RemoteTimelineClient {
                     }
                 };
 
-                // consistency check
-                assert_eq!(
-                    qi.num_inprogress_layer_uploads
-                        + qi.num_inprogress_metadata_uploads
-                        + qi.num_inprogress_deletions,
-                    qi.inprogress_tasks.len()
-                );
-
                 // We don't need to do anything here for in-progress tasks. They will finish
                 // on their own, decrement the unfinished-task counter themselves, and observe
                 // that the queue is Stopped.
@@ -1640,39 +2430,104 @@ impl RemoteTimelineClient {
 
                 // Tear down queued ops
                 for op in qi.queued_operations.into_iter() {
-                    self.calls_unfinished_metric_end(&op);
+                    self.metric_end(&op);
                     // Dropping UploadOp::Barrier() here will make wait_completion() return with an Err()
                     // which is exactly what we want to happen.
                     drop(op);
                 }
-
-                // We're done.
-                drop(guard);
-                Ok(())
             }
         }
     }
 
-    pub(crate) fn get_layers_metadata(
+    /// Returns an accessor which will hold the UploadQueue mutex for accessing the upload queue
+    /// externally to RemoteTimelineClient.
+    pub(crate) fn initialized_upload_queue(
         &self,
-        layers: Vec<LayerFileName>,
-    ) -> anyhow::Result<Vec<Option<LayerFileMetadata>>> {
-        let q = self.upload_queue.lock().unwrap();
-        let q = match &*q {
-            UploadQueue::Stopped(_) | UploadQueue::Uninitialized => {
-                anyhow::bail!("queue is in state {}", q.as_str())
-            }
-            UploadQueue::Initialized(inner) => inner,
-        };
-
-        let decorated = layers.into_iter().map(|l| q.latest_files.get(&l).cloned());
-
-        Ok(decorated.collect())
+    ) -> Result<UploadQueueAccessor<'_>, NotInitialized> {
+        let mut inner = self.upload_queue.lock().unwrap();
+        inner.initialized_mut()?;
+        Ok(UploadQueueAccessor { inner })
     }
+
+    pub(crate) fn no_pending_work(&self) -> bool {
+        let inner = self.upload_queue.lock().unwrap();
+        match &*inner {
+            UploadQueue::Uninitialized
+            | UploadQueue::Stopped(UploadQueueStopped::Uninitialized) => true,
+            UploadQueue::Stopped(UploadQueueStopped::Deletable(x)) => {
+                x.upload_queue_for_deletion.no_pending_work()
+            }
+            UploadQueue::Initialized(x) => x.no_pending_work(),
+        }
+    }
+
+    /// 'foreign' in the sense that it does not belong to this tenant shard.  This method
+    /// is used during GC for other shards to get the index of shard zero.
+    pub(crate) async fn download_foreign_index(
+        &self,
+        shard_number: ShardNumber,
+        cancel: &CancellationToken,
+    ) -> Result<(IndexPart, Generation, std::time::SystemTime), DownloadError> {
+        let foreign_shard_id = TenantShardId {
+            shard_number,
+            shard_count: self.tenant_shard_id.shard_count,
+            tenant_id: self.tenant_shard_id.tenant_id,
+        };
+        download_index_part(
+            &self.storage_impl,
+            &foreign_shard_id,
+            &self.timeline_id,
+            Generation::MAX,
+            cancel,
+        )
+        .await
+    }
+}
+
+pub(crate) struct UploadQueueAccessor<'a> {
+    inner: std::sync::MutexGuard<'a, UploadQueue>,
+}
+
+impl UploadQueueAccessor<'_> {
+    pub(crate) fn latest_uploaded_index_part(&self) -> &IndexPart {
+        match &*self.inner {
+            UploadQueue::Initialized(x) => &x.clean.0,
+            UploadQueue::Uninitialized | UploadQueue::Stopped(_) => {
+                unreachable!("checked before constructing")
+            }
+        }
+    }
+}
+
+pub fn remote_tenant_path(tenant_shard_id: &TenantShardId) -> RemotePath {
+    let path = format!("tenants/{tenant_shard_id}");
+    RemotePath::from_string(&path).expect("Failed to construct path")
+}
+
+pub fn remote_tenant_manifest_path(
+    tenant_shard_id: &TenantShardId,
+    generation: Generation,
+) -> RemotePath {
+    let path = format!(
+        "tenants/{tenant_shard_id}/tenant-manifest{}.json",
+        generation.get_suffix()
+    );
+    RemotePath::from_string(&path).expect("Failed to construct path")
+}
+
+/// Prefix to all generations' manifest objects in a tenant shard
+pub fn remote_tenant_manifest_prefix(tenant_shard_id: &TenantShardId) -> RemotePath {
+    let path = format!("tenants/{tenant_shard_id}/tenant-manifest",);
+    RemotePath::from_string(&path).expect("Failed to construct path")
 }
 
 pub fn remote_timelines_path(tenant_shard_id: &TenantShardId) -> RemotePath {
     let path = format!("tenants/{tenant_shard_id}/{TIMELINES_SEGMENT_NAME}");
+    RemotePath::from_string(&path).expect("Failed to construct path")
+}
+
+fn remote_timelines_path_unsharded(tenant_id: &TenantId) -> RemotePath {
+    let path = format!("tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}");
     RemotePath::from_string(&path).expect("Failed to construct path")
 }
 
@@ -1683,6 +2538,8 @@ pub fn remote_timeline_path(
     remote_timelines_path(tenant_shard_id).join(Utf8Path::new(&timeline_id.to_string()))
 }
 
+/// Obtains the path of the given Layer in the remote
+///
 /// Note that the shard component of a remote layer path is _not_ always the same
 /// as in the TenantShardId of the caller: tenants may reference layers from a different
 /// ShardIndex.  Use the ShardIndex from the layer's metadata.
@@ -1690,23 +2547,48 @@ pub fn remote_layer_path(
     tenant_id: &TenantId,
     timeline_id: &TimelineId,
     shard: ShardIndex,
-    layer_file_name: &LayerFileName,
+    layer_file_name: &LayerName,
     generation: Generation,
 ) -> RemotePath {
     // Generation-aware key format
     let path = format!(
         "tenants/{tenant_id}{0}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{1}{2}",
         shard.get_suffix(),
-        layer_file_name.file_name(),
+        layer_file_name,
         generation.get_suffix()
     );
 
     RemotePath::from_string(&path).expect("Failed to construct path")
 }
 
+/// Returns true if a and b have the same layer path within a tenant/timeline. This is essentially
+/// remote_layer_path(a) == remote_layer_path(b) without the string allocations.
+///
+/// TODO: there should be a variant of LayerName for the physical path that contains information
+/// about the shard and generation, such that this could be replaced by a simple comparison.
+pub fn is_same_remote_layer_path(
+    aname: &LayerName,
+    ameta: &LayerFileMetadata,
+    bname: &LayerName,
+    bmeta: &LayerFileMetadata,
+) -> bool {
+    // NB: don't assert remote_layer_path(a) == remote_layer_path(b); too expensive even for debug.
+    aname == bname && ameta.shard == bmeta.shard && ameta.generation == bmeta.generation
+}
+
 pub fn remote_initdb_archive_path(tenant_id: &TenantId, timeline_id: &TimelineId) -> RemotePath {
     RemotePath::from_string(&format!(
         "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{INITDB_PATH}"
+    ))
+    .expect("Failed to construct path")
+}
+
+pub fn remote_initdb_preserved_archive_path(
+    tenant_id: &TenantId,
+    timeline_id: &TimelineId,
+) -> RemotePath {
+    RemotePath::from_string(&format!(
+        "tenants/{tenant_id}/{TIMELINES_SEGMENT_NAME}/{timeline_id}/{INITDB_PRESERVED_PATH}"
     ))
     .expect("Failed to construct path")
 }
@@ -1724,11 +2606,11 @@ pub fn remote_index_path(
     .expect("Failed to construct path")
 }
 
-pub const HEATMAP_BASENAME: &str = "heatmap-v1.json";
-
 pub(crate) fn remote_heatmap_path(tenant_shard_id: &TenantShardId) -> RemotePath {
-    RemotePath::from_string(&format!("tenants/{tenant_shard_id}/{HEATMAP_BASENAME}"))
-        .expect("Failed to construct path")
+    RemotePath::from_string(&format!(
+        "tenants/{tenant_shard_id}/{TENANT_HEATMAP_BASENAME}"
+    ))
+    .expect("Failed to construct path")
 }
 
 /// Given the key of an index, parse out the generation part of the name
@@ -1748,27 +2630,13 @@ pub fn parse_remote_index_path(path: RemotePath) -> Option<Generation> {
     }
 }
 
-/// Files on the remote storage are stored with paths, relative to the workdir.
-/// That path includes in itself both tenant and timeline ids, allowing to have a unique remote storage path.
-///
-/// Errors if the path provided does not start from pageserver's workdir.
-pub fn remote_path(
-    conf: &PageServerConf,
-    local_path: &Utf8Path,
-    generation: Generation,
-) -> anyhow::Result<RemotePath> {
-    let stripped = local_path
-        .strip_prefix(&conf.workdir)
-        .context("Failed to strip workdir prefix")?;
-
-    let suffixed = format!("{0}{1}", stripped, generation.get_suffix());
-
-    RemotePath::new(Utf8Path::new(&suffixed)).with_context(|| {
-        format!(
-            "to resolve remote part of path {:?} for base {:?}",
-            local_path, conf.workdir
-        )
-    })
+/// Given the key of a tenant manifest, parse out the generation number
+pub fn parse_remote_tenant_manifest_path(path: RemotePath) -> Option<Generation> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r".*tenant-manifest-([0-9a-f]{8}).json").unwrap());
+    re.captures(path.get_path().as_str())
+        .and_then(|c| c.get(1))
+        .and_then(|m| Generation::parse_suffix(m.as_str()))
 }
 
 #[cfg(test)]
@@ -1777,15 +2645,15 @@ mod tests {
     use crate::{
         context::RequestContext,
         tenant::{
+            config::AttachmentMode,
             harness::{TenantHarness, TIMELINE_ID},
-            storage_layer::Layer,
-            Generation, Tenant, Timeline,
+            storage_layer::layer::local_layer_path,
+            Tenant, Timeline,
         },
         DEFAULT_PG_VERSION,
     };
 
     use std::collections::HashSet;
-    use utils::lsn::Lsn;
 
     pub(super) fn dummy_contents(name: &str) -> Vec<u8> {
         format!("contents for {name}").into()
@@ -1808,8 +2676,8 @@ mod tests {
         TimelineMetadata::from_bytes(&metadata.to_bytes().unwrap()).unwrap()
     }
 
-    fn assert_file_list(a: &HashSet<LayerFileName>, b: &[&str]) {
-        let mut avec: Vec<String> = a.iter().map(|x| x.file_name()).collect();
+    fn assert_file_list(a: &HashSet<LayerName>, b: &[&str]) {
+        let mut avec: Vec<String> = a.iter().map(|x| x.to_string()).collect();
         avec.sort();
 
         let mut bvec = b.to_vec();
@@ -1846,7 +2714,7 @@ mod tests {
     impl TestSetup {
         async fn new(test_name: &str) -> anyhow::Result<Self> {
             let test_name = Box::leak(Box::new(format!("remote_timeline_client__{test_name}")));
-            let harness = TenantHarness::create(test_name)?;
+            let harness = TenantHarness::create(test_name).await?;
             let (tenant, ctx) = harness.load().await;
 
             let timeline = tenant
@@ -1863,6 +2731,10 @@ mod tests {
 
         /// Construct a RemoteTimelineClient in an arbitrary generation
         fn build_client(&self, generation: Generation) -> Arc<RemoteTimelineClient> {
+            let location_conf = AttachedLocationConfig {
+                generation,
+                attach_mode: AttachmentMode::Single,
+            };
             Arc::new(RemoteTimelineClient {
                 conf: self.harness.conf,
                 runtime: tokio::runtime::Handle::current(),
@@ -1876,6 +2748,7 @@ mod tests {
                     &self.harness.tenant_shard_id,
                     &TIMELINE_ID,
                 )),
+                config: std::sync::RwLock::new(RemoteTimelineClientConfig::from(&location_conf)),
                 cancel: CancellationToken::new(),
             })
         }
@@ -1885,7 +2758,8 @@ mod tests {
         fn span(&self) -> tracing::Span {
             tracing::info_span!(
                 "test",
-                tenant_id = %self.harness.tenant_id,
+                tenant_id = %self.harness.tenant_shard_id.tenant_id,
+                shard_id = %self.harness.tenant_shard_id.shard_slug(),
                 timeline_id = %TIMELINE_ID
             )
         }
@@ -1919,11 +2793,11 @@ mod tests {
             tenant_ctx: _tenant_ctx,
         } = test_setup;
 
-        let client = timeline.remote_client.as_ref().unwrap();
+        let client = &timeline.remote_client;
 
         // Download back the index.json, and check that the list of files is correct
         let initial_index_part = match client
-            .download_index_file(CancellationToken::new())
+            .download_index_file(&CancellationToken::new())
             .await
             .unwrap()
         {
@@ -1934,7 +2808,7 @@ mod tests {
             .layer_metadata
             .keys()
             .map(|f| f.to_owned())
-            .collect::<HashSet<LayerFileName>>();
+            .collect::<HashSet<LayerName>>();
         let initial_layer = {
             assert!(initial_layers.len() == 1);
             initial_layers.into_iter().next().unwrap()
@@ -1960,12 +2834,21 @@ mod tests {
             ("000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59DA-00000000016B5A53".parse().unwrap(), dummy_contents("baz"))
         ]
         .into_iter()
-        .map(|(name, contents): (LayerFileName, Vec<u8>)| {
-            std::fs::write(timeline_path.join(name.file_name()), &contents).unwrap();
+        .map(|(name, contents): (LayerName, Vec<u8>)| {
+
+            let local_path = local_layer_path(
+                harness.conf,
+                &timeline.tenant_shard_id,
+                &timeline.timeline_id,
+                &name,
+                &generation,
+            );
+            std::fs::write(&local_path, &contents).unwrap();
 
             Layer::for_resident(
                 harness.conf,
                 &timeline,
+                local_path,
                 name,
                 LayerFileMetadata::new(contents.len() as u64, generation, shard),
             )
@@ -1986,8 +2869,8 @@ mod tests {
             let mut guard = client.upload_queue.lock().unwrap();
             let upload_queue = guard.initialized_mut().unwrap();
             assert!(upload_queue.queued_operations.is_empty());
-            assert!(upload_queue.inprogress_tasks.len() == 2);
-            assert!(upload_queue.num_inprogress_layer_uploads == 2);
+            assert_eq!(upload_queue.inprogress_tasks.len(), 2);
+            assert_eq!(upload_queue.num_inprogress_layer_uploads(), 2);
 
             // also check that `latest_file_changes` was updated
             assert!(upload_queue.latest_files_changes_since_metadata_upload_scheduled == 2);
@@ -1996,7 +2879,7 @@ mod tests {
         // Schedule upload of index. Check that it is queued
         let metadata = dummy_metadata(Lsn(0x20));
         client
-            .schedule_index_upload_for_metadata_update(&metadata)
+            .schedule_index_upload_for_full_metadata_update(&metadata)
             .unwrap();
         {
             let mut guard = client.upload_queue.lock().unwrap();
@@ -2017,7 +2900,7 @@ mod tests {
 
         // Download back the index.json, and check that the list of files is correct
         let index_part = match client
-            .download_index_file(CancellationToken::new())
+            .download_index_file(&CancellationToken::new())
             .await
             .unwrap()
         {
@@ -2032,9 +2915,9 @@ mod tests {
                 .map(|f| f.to_owned())
                 .collect(),
             &[
-                &initial_layer.file_name(),
-                &layers[0].layer_desc().filename().file_name(),
-                &layers[1].layer_desc().filename().file_name(),
+                &initial_layer.to_string(),
+                &layers[0].layer_desc().layer_name().to_string(),
+                &layers[1].layer_desc().layer_name().to_string(),
             ],
         );
         assert_eq!(index_part.metadata, metadata);
@@ -2048,7 +2931,7 @@ mod tests {
         // keep using schedule_layer_file_deletion because we don't have a way to wait for the
         // spawn_blocking started by the drop.
         client
-            .schedule_layer_file_deletion(&[layers[0].layer_desc().filename()])
+            .schedule_layer_file_deletion(&[layers[0].layer_desc().layer_name()])
             .unwrap();
         {
             let mut guard = client.upload_queue.lock().unwrap();
@@ -2057,8 +2940,8 @@ mod tests {
             // Deletion schedules upload of the index file, and the file deletion itself
             assert_eq!(upload_queue.queued_operations.len(), 2);
             assert_eq!(upload_queue.inprogress_tasks.len(), 1);
-            assert_eq!(upload_queue.num_inprogress_layer_uploads, 1);
-            assert_eq!(upload_queue.num_inprogress_deletions, 0);
+            assert_eq!(upload_queue.num_inprogress_layer_uploads(), 1);
+            assert_eq!(upload_queue.num_inprogress_deletions(), 0);
             assert_eq!(
                 upload_queue.latest_files_changes_since_metadata_upload_scheduled,
                 0
@@ -2066,9 +2949,9 @@ mod tests {
         }
         assert_remote_files(
             &[
-                &initial_layer.file_name(),
-                &layers[0].layer_desc().filename().file_name(),
-                &layers[1].layer_desc().filename().file_name(),
+                &initial_layer.to_string(),
+                &layers[0].layer_desc().layer_name().to_string(),
+                &layers[1].layer_desc().layer_name().to_string(),
                 "index_part.json",
             ],
             &remote_timeline_dir,
@@ -2081,9 +2964,9 @@ mod tests {
 
         assert_remote_files(
             &[
-                &initial_layer.file_name(),
-                &layers[1].layer_desc().filename().file_name(),
-                &layers[2].layer_desc().filename().file_name(),
+                &initial_layer.to_string(),
+                &layers[1].layer_desc().layer_name().to_string(),
+                &layers[2].layer_desc().layer_name().to_string(),
                 "index_part.json",
             ],
             &remote_timeline_dir,
@@ -2101,20 +2984,23 @@ mod tests {
             timeline,
             ..
         } = TestSetup::new("metrics").await.unwrap();
-        let client = timeline.remote_client.as_ref().unwrap();
-        let timeline_path = harness.timeline_path(&TIMELINE_ID);
+        let client = &timeline.remote_client;
 
-        let layer_file_name_1: LayerFileName = "000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59D8-00000000016B5A51".parse().unwrap();
+        let layer_file_name_1: LayerName = "000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__00000000016B59D8-00000000016B5A51".parse().unwrap();
+        let local_path = local_layer_path(
+            harness.conf,
+            &timeline.tenant_shard_id,
+            &timeline.timeline_id,
+            &layer_file_name_1,
+            &harness.generation,
+        );
         let content_1 = dummy_contents("foo");
-        std::fs::write(
-            timeline_path.join(layer_file_name_1.file_name()),
-            &content_1,
-        )
-        .unwrap();
+        std::fs::write(&local_path, &content_1).unwrap();
 
         let layer_file_1 = Layer::for_resident(
             harness.conf,
             &timeline,
+            local_path,
             layer_file_name_1.clone(),
             LayerFileMetadata::new(content_1.len() as u64, harness.generation, harness.shard),
         );
@@ -2183,23 +3069,9 @@ mod tests {
 
     async fn inject_index_part(test_state: &TestSetup, generation: Generation) -> IndexPart {
         // An empty IndexPart, just sufficient to ensure deserialization will succeed
-        let example_metadata = TimelineMetadata::example();
-        let example_index_part = IndexPart::new(
-            HashMap::new(),
-            example_metadata.disk_consistent_lsn(),
-            example_metadata,
-        );
+        let example_index_part = IndexPart::example();
 
         let index_part_bytes = serde_json::to_vec(&example_index_part).unwrap();
-
-        let timeline_path = test_state.harness.timeline_path(&TIMELINE_ID);
-        let remote_timeline_dir = test_state.harness.remote_fs_dir.join(
-            timeline_path
-                .strip_prefix(&test_state.harness.conf.workdir)
-                .unwrap(),
-        );
-
-        std::fs::create_dir_all(remote_timeline_dir).expect("creating test dir should work");
 
         let index_path = test_state.harness.remote_fs_dir.join(
             remote_index_path(
@@ -2209,6 +3081,10 @@ mod tests {
             )
             .get_path(),
         );
+
+        std::fs::create_dir_all(index_path.parent().unwrap())
+            .expect("creating test dir should work");
+
         eprintln!("Writing {index_path}");
         std::fs::write(&index_path, index_part_bytes).unwrap();
         example_index_part
@@ -2224,7 +3100,7 @@ mod tests {
         let client = test_state.build_client(get_generation);
 
         let download_r = client
-            .download_index_file(CancellationToken::new())
+            .download_index_file(&CancellationToken::new())
             .await
             .expect("download should always succeed");
         assert!(matches!(download_r, MaybeDeletedIndexPart::IndexPart(_)));

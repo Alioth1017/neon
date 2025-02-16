@@ -17,7 +17,7 @@ use std::io::Write;
 use std::os::unix::prelude::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::Duration;
 use std::{fs, io, thread};
 
@@ -36,11 +36,11 @@ use utils::pid_file::{self, PidFileRead};
 // it's waiting. If the process hasn't started/stopped after 5 seconds,
 // it prints a notice that it's taking long, but keeps waiting.
 //
-const RETRY_UNTIL_SECS: u64 = 10;
-const RETRIES: u64 = (RETRY_UNTIL_SECS * 1000) / RETRY_INTERVAL_MILLIS;
-const RETRY_INTERVAL_MILLIS: u64 = 100;
-const DOT_EVERY_RETRIES: u64 = 10;
-const NOTICE_AFTER_RETRIES: u64 = 50;
+const STOP_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+const STOP_RETRIES: u128 = STOP_RETRY_TIMEOUT.as_millis() / RETRY_INTERVAL.as_millis();
+const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const DOT_EVERY_RETRIES: u128 = 10;
+const NOTICE_AFTER_RETRIES: u128 = 50;
 
 /// Argument to `start_process`, to indicate whether it should create pidfile or if the process creates
 /// it itself.
@@ -52,6 +52,7 @@ pub enum InitialPidFile {
 }
 
 /// Start a background child process using the parameters given.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_process<F, Fut, AI, A, EI>(
     process_name: &str,
     datadir: &Path,
@@ -59,8 +60,9 @@ pub async fn start_process<F, Fut, AI, A, EI>(
     args: AI,
     envs: EI,
     initial_pid_file: InitialPidFile,
+    retry_timeout: &Duration,
     process_status_check: F,
-) -> anyhow::Result<Child>
+) -> anyhow::Result<()>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<bool>>,
@@ -69,10 +71,13 @@ where
     // Not generic AsRef<OsStr>, otherwise empty `envs` prevents type inference
     EI: IntoIterator<Item = (String, String)>,
 {
+    let retries: u128 = retry_timeout.as_millis() / RETRY_INTERVAL.as_millis();
+    if !datadir.metadata().context("stat datadir")?.is_dir() {
+        anyhow::bail!("`datadir` must be a directory when calling this function: {datadir:?}");
+    }
     let log_path = datadir.join(format!("{process_name}.log"));
     let process_log_file = fs::OpenOptions::new()
         .create(true)
-        .write(true)
         .append(true)
         .open(&log_path)
         .with_context(|| {
@@ -86,8 +91,17 @@ where
     let background_command = command
         .stdout(process_log_file)
         .stderr(same_file_for_stderr)
-        .args(args);
-    let filled_cmd = fill_remote_storage_secrets_vars(fill_rust_env_vars(background_command));
+        .args(args)
+        // spawn all child processes in their datadir, useful for all kinds of things,
+        // not least cleaning up child processes e.g. after an unclean exit from the test suite:
+        // ```
+        // lsof  -d cwd -a +D  Users/cs/src/neon/test_output
+        // ```
+        .current_dir(datadir);
+
+    let filled_cmd = fill_env_vars_prefixed_neon(fill_remote_storage_secrets_vars(
+        fill_rust_env_vars(background_command),
+    ));
     filled_cmd.envs(envs);
 
     let pid_file_to_check = match &initial_pid_file {
@@ -98,7 +112,7 @@ where
         InitialPidFile::Expect(path) => path,
     };
 
-    let mut spawned_process = filled_cmd.spawn().with_context(|| {
+    let spawned_process = filled_cmd.spawn().with_context(|| {
         format!("Could not spawn {process_name}, see console output and log files for details.")
     })?;
     let pid = spawned_process.id();
@@ -106,12 +120,26 @@ where
         i32::try_from(pid)
             .with_context(|| format!("Subprocess {process_name} has invalid pid {pid}"))?,
     );
+    // set up a scopeguard to kill & wait for the child in case we panic or bail below
+    let spawned_process = scopeguard::guard(spawned_process, |mut spawned_process| {
+        println!("SIGKILL & wait the started process");
+        (|| {
+            // TODO: use another signal that can be caught by the child so it can clean up any children it spawned (e..g, walredo).
+            spawned_process.kill().context("SIGKILL child")?;
+            spawned_process.wait().context("wait() for child process")?;
+            anyhow::Ok(())
+        })()
+        .with_context(|| format!("scopeguard kill&wait child {process_name:?}"))
+        .unwrap();
+    });
 
-    for retries in 0..RETRIES {
+    for retries in 0..retries {
         match process_started(pid, pid_file_to_check, &process_status_check).await {
             Ok(true) => {
-                println!("\n{process_name} started, pid: {pid}");
-                return Ok(spawned_process);
+                println!("\n{process_name} started and passed status check, pid: {pid}");
+                // leak the child process, it'll outlive this neon_local invocation
+                drop(scopeguard::ScopeGuard::into_inner(spawned_process));
+                return Ok(());
             }
             Ok(false) => {
                 if retries == NOTICE_AFTER_RETRIES {
@@ -123,19 +151,19 @@ where
                     print!(".");
                     io::stdout().flush().unwrap();
                 }
-                thread::sleep(Duration::from_millis(RETRY_INTERVAL_MILLIS));
+                tokio::time::sleep(RETRY_INTERVAL).await;
             }
             Err(e) => {
-                println!("{process_name} failed to start: {e:#}");
-                if let Err(e) = spawned_process.kill() {
-                    println!("Could not stop {process_name} subprocess: {e:#}")
-                };
+                println!("error starting process {process_name:?}: {e:#}");
                 return Err(e);
             }
         }
     }
     println!();
-    anyhow::bail!("{process_name} did not start in {RETRY_UNTIL_SECS} seconds");
+    anyhow::bail!(format!(
+        "{} did not start+pass status checks within {:?} seconds",
+        process_name, retry_timeout
+    ));
 }
 
 /// Stops the process, using the pid file given. Returns Ok also if the process is already not running.
@@ -191,7 +219,7 @@ pub fn stop_process(
 }
 
 pub fn wait_until_stopped(process_name: &str, pid: Pid) -> anyhow::Result<()> {
-    for retries in 0..RETRIES {
+    for retries in 0..STOP_RETRIES {
         match process_has_stopped(pid) {
             Ok(true) => {
                 println!("\n{process_name} stopped");
@@ -207,7 +235,7 @@ pub fn wait_until_stopped(process_name: &str, pid: Pid) -> anyhow::Result<()> {
                     print!(".");
                     io::stdout().flush().unwrap();
                 }
-                thread::sleep(Duration::from_millis(RETRY_INTERVAL_MILLIS));
+                thread::sleep(RETRY_INTERVAL);
             }
             Err(e) => {
                 println!("{process_name} with pid {pid} failed to stop: {e:#}");
@@ -216,7 +244,10 @@ pub fn wait_until_stopped(process_name: &str, pid: Pid) -> anyhow::Result<()> {
         }
     }
     println!();
-    anyhow::bail!("{process_name} with pid {pid} did not stop in {RETRY_UNTIL_SECS} seconds");
+    anyhow::bail!(format!(
+        "{} with pid {} did not stop in {:?} seconds",
+        process_name, pid, STOP_RETRY_TIMEOUT
+    ));
 }
 
 fn fill_rust_env_vars(cmd: &mut Command) -> &mut Command {
@@ -230,7 +261,13 @@ fn fill_rust_env_vars(cmd: &mut Command) -> &mut Command {
     let mut filled_cmd = cmd.env_clear().env("RUST_BACKTRACE", backtrace_setting);
 
     // Pass through these environment variables to the command
-    for var in ["LLVM_PROFILE_FILE", "FAILPOINTS", "RUST_LOG"] {
+    for var in [
+        "LLVM_PROFILE_FILE",
+        "FAILPOINTS",
+        "RUST_LOG",
+        "ASAN_OPTIONS",
+        "UBSAN_OPTIONS",
+    ] {
         if let Some(val) = std::env::var_os(var) {
             filled_cmd = filled_cmd.env(var, val);
         }
@@ -244,11 +281,23 @@ fn fill_remote_storage_secrets_vars(mut cmd: &mut Command) -> &mut Command {
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        // HOME is needed in combination with `AWS_PROFILE` to pick up the SSO sessions.
+        "HOME",
         "AZURE_STORAGE_ACCOUNT",
         "AZURE_STORAGE_ACCESS_KEY",
     ] {
         if let Ok(value) = std::env::var(env_key) {
             cmd = cmd.env(env_key, value);
+        }
+    }
+    cmd
+}
+
+fn fill_env_vars_prefixed_neon(mut cmd: &mut Command) -> &mut Command {
+    for (var, val) in std::env::vars() {
+        if var.starts_with("NEON_") {
+            cmd = cmd.env(var, val);
         }
     }
     cmd
@@ -280,7 +329,7 @@ where
     //      is in state 'taken' but the thread that would unlock it is
     //      not there.
     //   2. A rust object that represented some external resource in the
-    //      parent now got implicitly copied by the the fork, even though
+    //      parent now got implicitly copied by the fork, even though
     //      the object's type is not `Copy`. The parent program may use
     //      non-copyability as way to enforce unique ownership of an
     //      external resource in the typesystem. The fork breaks that
@@ -337,7 +386,7 @@ where
     }
 }
 
-fn process_has_stopped(pid: Pid) -> anyhow::Result<bool> {
+pub(crate) fn process_has_stopped(pid: Pid) -> anyhow::Result<bool> {
     match kill(pid, None) {
         // Process exists, keep waiting
         Ok(_) => Ok(false),

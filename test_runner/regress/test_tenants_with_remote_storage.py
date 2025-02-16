@@ -6,11 +6,13 @@
 # checkpoint_distance setting so that a lot of layer files are created.
 #
 
+from __future__ import annotations
+
 import asyncio
 import os
 from pathlib import Path
-from typing import List, Tuple
 
+from fixtures.common_types import Lsn, TenantId, TimelineId
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
     Endpoint,
@@ -18,6 +20,7 @@ from fixtures.neon_fixtures import (
     NeonEnvBuilder,
     last_flush_lsn_upload,
 )
+from fixtures.pageserver.common_types import parse_layer_file_name
 from fixtures.pageserver.utils import (
     assert_tenant_state,
     wait_for_last_record_lsn,
@@ -27,7 +30,6 @@ from fixtures.remote_storage import (
     LocalFsStorage,
     RemoteStorageKind,
 )
-from fixtures.types import Lsn, TenantId, TimelineId
 from fixtures.utils import query_scalar, wait_until
 
 
@@ -61,24 +63,18 @@ async def all_tenants_workload(env: NeonEnv, tenants_endpoints):
 def test_tenants_many(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
 
-    # FIXME: Is this expected?
-    env.pageserver.allowed_errors.append(
-        ".*init_tenant_mgr: marking .* as locally complete, while it doesnt exist in remote index.*"
-    )
-
-    tenants_endpoints: List[Tuple[TenantId, Endpoint]] = []
+    tenants_endpoints: list[tuple[TenantId, Endpoint]] = []
 
     for _ in range(1, 5):
         # Use a tiny checkpoint distance, to create a lot of layers quickly
-        tenant, _ = env.neon_cli.create_tenant(
+        tenant, _ = env.create_tenant(
             conf={
                 "checkpoint_distance": "5000000",
             }
         )
-        env.neon_cli.create_timeline("test_tenants_many", tenant_id=tenant)
 
         endpoint = env.endpoints.create_start(
-            "test_tenants_many",
+            "main",
             tenant_id=tenant,
         )
         tenants_endpoints.append((tenant, endpoint))
@@ -117,14 +113,6 @@ def test_tenants_attached_after_download(neon_env_builder: NeonEnvBuilder):
     ##### First start, insert secret data and upload it to the remote storage
     env = neon_env_builder.init_start()
 
-    env.pageserver.allowed_errors.extend(
-        [
-            # FIXME: Are these expected?
-            ".*No timelines to attach received.*",
-            ".*marking .* as locally complete, while it doesnt exist in remote index.*",
-        ]
-    )
-
     pageserver_http = env.pageserver.http_client()
     endpoint = env.endpoints.create_start("main")
 
@@ -160,10 +148,10 @@ def test_tenants_attached_after_download(neon_env_builder: NeonEnvBuilder):
         log.info(f"upload of checkpoint {checkpoint_number} is done")
 
     # Check that we had to retry the uploads
-    assert env.pageserver.log_contains(
+    env.pageserver.assert_log_contains(
         ".*failed to perform remote task UploadLayer.*, will retry.*"
     )
-    assert env.pageserver.log_contains(
+    env.pageserver.assert_log_contains(
         ".*failed to perform remote task UploadMetadata.*, will retry.*"
     )
 
@@ -190,19 +178,15 @@ def test_tenants_attached_after_download(neon_env_builder: NeonEnvBuilder):
     env.pageserver.start()
     client = env.pageserver.http_client()
 
-    wait_until(
-        number_of_iterations=5,
-        interval=1,
-        func=lambda: assert_tenant_state(client, tenant_id, "Active"),
-    )
+    wait_until(lambda: assert_tenant_state(client, tenant_id, "Active"))
 
     restored_timelines = client.timeline_list(tenant_id)
     assert (
         len(restored_timelines) == 1
     ), f"Tenant {tenant_id} should have its timeline reattached after its layer is downloaded from the remote storage"
     restored_timeline = restored_timelines[0]
-    assert restored_timeline["timeline_id"] == str(
-        timeline_id
+    assert (
+        restored_timeline["timeline_id"] == str(timeline_id)
     ), f"Tenant {tenant_id} should have its old timeline {timeline_id} restored from the remote storage"
 
     # Check that we had to retry the downloads
@@ -223,9 +207,6 @@ def test_tenant_redownloads_truncated_file_on_startup(
     env.pageserver.allowed_errors.extend(
         [
             ".*removing local file .* because .*",
-            # FIXME: Are these expected?
-            ".*init_tenant_mgr: marking .* as locally complete, while it doesnt exist in remote index.*",
-            ".*No timelines to attach received.*",
         ]
     )
 
@@ -262,26 +243,25 @@ def test_tenant_redownloads_truncated_file_on_startup(
 
     # ensure the same size is found from the index_part.json
     index_part = env.pageserver_remote_storage.index_content(tenant_id, timeline_id)
-    assert index_part["layer_metadata"][path.name]["file_size"] == expected_size
+    assert (
+        index_part["layer_metadata"][parse_layer_file_name(path.name).to_str()]["file_size"]
+        == expected_size
+    )
 
     ## Start the pageserver. It will notice that the file size doesn't match, and
     ## rename away the local file. It will be re-downloaded when it's needed.
     env.pageserver.start()
     client = env.pageserver.http_client()
 
-    wait_until(
-        number_of_iterations=5,
-        interval=1,
-        func=lambda: assert_tenant_state(client, tenant_id, "Active"),
-    )
+    wait_until(lambda: assert_tenant_state(client, tenant_id, "Active"))
 
     restored_timelines = client.timeline_list(tenant_id)
     assert (
         len(restored_timelines) == 1
     ), f"Tenant {tenant_id} should have its timeline reattached after its layer is downloaded from the remote storage"
     retored_timeline = restored_timelines[0]
-    assert retored_timeline["timeline_id"] == str(
-        timeline_id
+    assert (
+        retored_timeline["timeline_id"] == str(timeline_id)
     ), f"Tenant {tenant_id} should have its old timeline {timeline_id} restored from the remote storage"
 
     # Request non-incremental logical size. Calculating it needs the layer file that
@@ -292,7 +272,7 @@ def test_tenant_redownloads_truncated_file_on_startup(
 
     # the remote side of local_layer_truncated
     remote_layer_path = env.pageserver_remote_storage.remote_layer_path(
-        tenant_id, timeline_id, path.name
+        tenant_id, timeline_id, parse_layer_file_name(path.name).to_str()
     )
 
     # if the upload ever was ongoing, this check would be racy, but at least one

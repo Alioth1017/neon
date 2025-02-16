@@ -16,6 +16,13 @@ use remote_storage::RemotePath;
 /// intended to be used for DB / role names.
 pub type PgIdent = String;
 
+/// String type alias representing Postgres extension version
+pub type ExtVersion = String;
+
+fn default_reconfigure_concurrency() -> usize {
+    1
+}
+
 /// Cluster spec or configuration represented as an optional number of
 /// delta operations + final cluster state description.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -33,11 +40,47 @@ pub struct ComputeSpec {
     #[serde(default)]
     pub features: Vec<ComputeFeature>,
 
+    /// If compute_ctl was passed `--resize-swap-on-bind`, a value of `Some(_)` instructs
+    /// compute_ctl to `/neonvm/bin/resize-swap` with the given size, when the spec is first
+    /// received.
+    ///
+    /// Both this field and `--resize-swap-on-bind` are required, so that the control plane's
+    /// spec generation doesn't need to be aware of the actual compute it's running on, while
+    /// guaranteeing gradual rollout of swap. Otherwise, without `--resize-swap-on-bind`, we could
+    /// end up trying to resize swap in VMs without it -- or end up *not* resizing swap, thus
+    /// giving every VM much more swap than it should have (32GiB).
+    ///
+    /// Eventually we may remove `--resize-swap-on-bind` and exclusively use `swap_size_bytes` for
+    /// enabling the swap resizing behavior once rollout is complete.
+    ///
+    /// See neondatabase/cloud#12047 for more.
+    #[serde(default)]
+    pub swap_size_bytes: Option<u64>,
+
+    /// If compute_ctl was passed `--set-disk-quota-for-fs`, a value of `Some(_)` instructs
+    /// compute_ctl to run `/neonvm/bin/set-disk-quota` with the given size and fs, when the
+    /// spec is first received.
+    ///
+    /// Both this field and `--set-disk-quota-for-fs` are required, so that the control plane's
+    /// spec generation doesn't need to be aware of the actual compute it's running on, while
+    /// guaranteeing gradual rollout of disk quota.
+    #[serde(default)]
+    pub disk_quota_bytes: Option<u64>,
+
+    /// Disables the vm-monitor behavior that resizes LFC on upscale/downscale, instead relying on
+    /// the initial size of LFC.
+    ///
+    /// This is intended for use when the LFC size is being overridden from the default but
+    /// autoscaling is still enabled, and we don't want the vm-monitor to interfere with the custom
+    /// LFC sizing.
+    #[serde(default)]
+    pub disable_lfc_resizing: Option<bool>,
+
     /// Expected cluster state at the end of transition process.
     pub cluster: Cluster,
     pub delta_operations: Option<Vec<DeltaOp>>,
 
-    /// An optinal hint that can be passed to speed up startup time if we know
+    /// An optional hint that can be passed to speed up startup time if we know
     /// that no pg catalog mutations (like role creation, database creation,
     /// extension creation) need to be done on the actual database to start.
     #[serde(default)] // Default false
@@ -56,9 +99,7 @@ pub struct ComputeSpec {
     // etc. GUCs in cluster.settings. TODO: Once the control plane has been
     // updated to fill these fields, we can make these non optional.
     pub tenant_id: Option<TenantId>,
-
     pub timeline_id: Option<TimelineId>,
-
     pub pageserver_connstring: Option<String>,
 
     #[serde(default)]
@@ -73,6 +114,37 @@ pub struct ComputeSpec {
 
     // information about available remote extensions
     pub remote_extensions: Option<RemoteExtSpec>,
+
+    pub pgbouncer_settings: Option<HashMap<String, String>>,
+
+    // Stripe size for pageserver sharding, in pages
+    #[serde(default)]
+    pub shard_stripe_size: Option<usize>,
+
+    /// Local Proxy configuration used for JWT authentication
+    #[serde(default)]
+    pub local_proxy_config: Option<LocalProxySpec>,
+
+    /// Number of concurrent connections during the parallel RunInEachDatabase
+    /// phase of the apply config process.
+    ///
+    /// We need a higher concurrency during reconfiguration in case of many DBs,
+    /// but instance is already running and used by client. We can easily get out of
+    /// `max_connections` limit, and the current code won't handle that.
+    ///
+    /// Default is 1, but also allow control plane to override this value for specific
+    /// projects. It's also recommended to bump `superuser_reserved_connections` +=
+    /// `reconfigure_concurrency` for such projects to ensure that we always have
+    /// enough spare connections for reconfiguration process to succeed.
+    #[serde(default = "default_reconfigure_concurrency")]
+    pub reconfigure_concurrency: usize,
+
+    /// If set to true, the compute_ctl will drop all subscriptions before starting the
+    /// compute. This is needed when we start an endpoint on a branch, so that child
+    /// would not compete with parent branch subscriptions
+    /// over the same replication content from publisher.
+    #[serde(default)] // Default false
+    pub drop_subscriptions_before_start: bool,
 }
 
 /// Feature flag to signal `compute_ctl` to enable certain experimental functionality.
@@ -80,10 +152,16 @@ pub struct ComputeSpec {
 #[serde(rename_all = "snake_case")]
 pub enum ComputeFeature {
     // XXX: Add more feature flags here.
+    /// Enable the experimental activity monitor logic, which uses `pg_stat_database` to
+    /// track short-lived connections as user activity.
+    ActivityMonitorExperimental,
 
-    // This is a special feature flag that is used to represent unknown feature flags.
-    // Basically all unknown to enum flags are represented as this one. See unit test
-    // `parse_unknown_features()` for more details.
+    /// Pre-install and initialize anon extension for every database in the cluster
+    AnonExtension,
+
+    /// This is a special feature flag that is used to represent unknown feature flags.
+    /// Basically all unknown to enum flags are represented as this one. See unit test
+    /// `parse_unknown_features()` for more details.
     #[serde(other)]
     UnknownFeature,
 }
@@ -126,14 +204,16 @@ impl RemoteExtSpec {
 
         // Check if extension is present in public or custom.
         // If not, then it is not allowed to be used by this compute.
-        if let Some(public_extensions) = &self.public_extensions {
-            if !public_extensions.contains(&real_ext_name.to_string()) {
-                if let Some(custom_extensions) = &self.custom_extensions {
-                    if !custom_extensions.contains(&real_ext_name.to_string()) {
-                        return Err(anyhow::anyhow!("extension {} is not found", real_ext_name));
-                    }
-                }
-            }
+        if !self
+            .public_extensions
+            .as_ref()
+            .is_some_and(|exts| exts.iter().any(|e| e == real_ext_name))
+            && !self
+                .custom_extensions
+                .as_ref()
+                .is_some_and(|exts| exts.iter().any(|e| e == real_ext_name))
+        {
+            return Err(anyhow::anyhow!("extension {} is not found", real_ext_name));
         }
 
         match self.extension_data.get(real_ext_name) {
@@ -239,10 +319,124 @@ pub struct GenericOption {
 /// declare a `trait` on it.
 pub type GenericOptions = Option<Vec<GenericOption>>;
 
+/// Configured the local_proxy application with the relevant JWKS and roles it should
+/// use for authorizing connect requests using JWT.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LocalProxySpec {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<Vec<JwksSettings>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct JwksSettings {
+    pub id: String,
+    pub role_names: Vec<String>,
+    pub jwks_url: String,
+    pub provider_name: String,
+    pub jwt_audience: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
+
+    #[test]
+    fn allow_installing_remote_extensions() {
+        let rspec: RemoteExtSpec = serde_json::from_value(serde_json::json!({
+            "public_extensions": null,
+            "custom_extensions": null,
+            "library_index": {},
+            "extension_data": {},
+        }))
+        .unwrap();
+
+        rspec
+            .get_ext("ext", false, "latest", "v17")
+            .expect_err("Extension should not be found");
+
+        let rspec: RemoteExtSpec = serde_json::from_value(serde_json::json!({
+            "public_extensions": [],
+            "custom_extensions": null,
+            "library_index": {},
+            "extension_data": {},
+        }))
+        .unwrap();
+
+        rspec
+            .get_ext("ext", false, "latest", "v17")
+            .expect_err("Extension should not be found");
+
+        let rspec: RemoteExtSpec = serde_json::from_value(serde_json::json!({
+            "public_extensions": [],
+            "custom_extensions": [],
+            "library_index": {
+                "ext": "ext"
+            },
+            "extension_data": {
+                "ext": {
+                    "control_data": {
+                        "ext.control": ""
+                    },
+                    "archive_path": ""
+                }
+            },
+        }))
+        .unwrap();
+
+        rspec
+            .get_ext("ext", false, "latest", "v17")
+            .expect_err("Extension should not be found");
+
+        let rspec: RemoteExtSpec = serde_json::from_value(serde_json::json!({
+            "public_extensions": [],
+            "custom_extensions": ["ext"],
+            "library_index": {
+                "ext": "ext"
+            },
+            "extension_data": {
+                "ext": {
+                    "control_data": {
+                        "ext.control": ""
+                    },
+                    "archive_path": ""
+                }
+            },
+        }))
+        .unwrap();
+
+        rspec
+            .get_ext("ext", false, "latest", "v17")
+            .expect("Extension should be found");
+
+        let rspec: RemoteExtSpec = serde_json::from_value(serde_json::json!({
+            "public_extensions": ["ext"],
+            "custom_extensions": [],
+            "library_index": {
+                "extlib": "ext",
+            },
+            "extension_data": {
+                "ext": {
+                    "control_data": {
+                        "ext.control": ""
+                    },
+                    "archive_path": ""
+                }
+            },
+        }))
+        .unwrap();
+
+        rspec
+            .get_ext("ext", false, "latest", "v17")
+            .expect("Extension should be found");
+
+        // test library index for the case when library name
+        // doesn't match the extension name
+        rspec
+            .get_ext("extlib", true, "latest", "v17")
+            .expect("Library should be found");
+    }
 
     #[test]
     fn parse_spec_file() {
@@ -251,6 +445,9 @@ mod tests {
 
         // Features list defaults to empty vector.
         assert!(spec.features.is_empty());
+
+        // Reconfigure concurrency defaults to 1.
+        assert_eq!(spec.reconfigure_concurrency, 1);
     }
 
     #[test]
@@ -279,5 +476,24 @@ mod tests {
         assert!(spec.features.len() == 2);
         assert!(spec.features.contains(&ComputeFeature::UnknownFeature));
         assert_eq!(spec.features, vec![ComputeFeature::UnknownFeature; 2]);
+    }
+
+    #[test]
+    fn parse_known_features() {
+        // Test that we can properly parse known feature flags.
+        let file = File::open("tests/cluster_spec.json").unwrap();
+        let mut json: serde_json::Value = serde_json::from_reader(file).unwrap();
+        let ob = json.as_object_mut().unwrap();
+
+        // Add known feature flags.
+        let features = vec!["activity_monitor_experimental"];
+        ob.insert("features".into(), features.into());
+
+        let spec: ComputeSpec = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            spec.features,
+            vec![ComputeFeature::ActivityMonitorExperimental]
+        );
     }
 }

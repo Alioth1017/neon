@@ -3,9 +3,30 @@ use std::str::FromStr;
 use anyhow::Context;
 use metrics::{IntCounter, IntCounterVec};
 use once_cell::sync::Lazy;
-use strum_macros::{EnumString, EnumVariantNames};
+use strum_macros::{EnumString, VariantNames};
 
-#[derive(EnumString, EnumVariantNames, Eq, PartialEq, Debug, Clone, Copy)]
+/// Logs a critical error, similarly to `tracing::error!`. This will:
+///
+/// * Emit an ERROR log message with prefix "CRITICAL:" and a backtrace.
+/// * Trigger a pageable alert (via the metric below).
+/// * Increment libmetrics_tracing_event_count{level="critical"}, and indirectly level="error".
+/// * In debug builds, panic the process.
+///
+/// When including errors in the message, please use {err:?} to include the error cause and original
+/// backtrace.
+#[macro_export]
+macro_rules! critical {
+    ($($arg:tt)*) => {{
+        if cfg!(debug_assertions) {
+            panic!($($arg)*);
+        }
+        $crate::logging::TRACING_EVENT_COUNT_METRIC.inc_critical();
+        let backtrace = std::backtrace::Backtrace::capture();
+        tracing::error!("CRITICAL: {}\n{backtrace}", format!($($arg)*));
+    }};
+}
+
+#[derive(EnumString, strum_macros::Display, VariantNames, Eq, PartialEq, Debug, Clone, Copy)]
 #[strum(serialize_all = "snake_case")]
 pub enum LogFormat {
     Plain,
@@ -25,7 +46,10 @@ impl LogFormat {
     }
 }
 
-struct TracingEventCountMetric {
+pub struct TracingEventCountMetric {
+    /// CRITICAL is not a `tracing` log level. Instead, we increment it in the `critical!` macro,
+    /// and also emit it as a regular error. These are thus double-counted, but that seems fine.
+    critical: IntCounter,
     error: IntCounter,
     warn: IntCounter,
     info: IntCounter,
@@ -33,7 +57,7 @@ struct TracingEventCountMetric {
     trace: IntCounter,
 }
 
-static TRACING_EVENT_COUNT_METRIC: Lazy<TracingEventCountMetric> = Lazy::new(|| {
+pub static TRACING_EVENT_COUNT_METRIC: Lazy<TracingEventCountMetric> = Lazy::new(|| {
     let vec = metrics::register_int_counter_vec!(
         "libmetrics_tracing_event_count",
         "Number of tracing events, by level",
@@ -46,12 +70,18 @@ static TRACING_EVENT_COUNT_METRIC: Lazy<TracingEventCountMetric> = Lazy::new(|| 
 impl TracingEventCountMetric {
     fn new(vec: IntCounterVec) -> Self {
         Self {
+            critical: vec.with_label_values(&["critical"]),
             error: vec.with_label_values(&["error"]),
             warn: vec.with_label_values(&["warn"]),
             info: vec.with_label_values(&["info"]),
             debug: vec.with_label_values(&["debug"]),
             trace: vec.with_label_values(&["trace"]),
         }
+    }
+
+    // Allow public access from `critical!` macro.
+    pub fn inc_critical(&self) {
+        self.critical.inc();
     }
 
     fn inc_for_level(&self, level: tracing::Level) {
@@ -188,7 +218,7 @@ impl Drop for TracingPanicHookGuard {
 }
 
 /// Named symbol for our panic hook, which logs the panic.
-fn tracing_panic_hook(info: &std::panic::PanicInfo) {
+fn tracing_panic_hook(info: &std::panic::PanicHookInfo) {
     // following rust 1.66.1 std implementation:
     // https://github.com/rust-lang/rust/blob/90743e7298aca107ddaa0c202a4d3604e29bfeb6/library/std/src/panicking.rs#L235-L288
     let location = info.location();
@@ -271,6 +301,14 @@ impl SecretString {
 impl From<String> for SecretString {
     fn from(s: String) -> Self {
         Self(s)
+    }
+}
+
+impl FromStr for SecretString {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
     }
 }
 

@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import time
 from dataclasses import dataclass
-from typing import List, Set, Tuple
+from typing import TYPE_CHECKING
 
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
@@ -12,12 +14,15 @@ from fixtures.pageserver.http import LayerMapInfo
 from fixtures.remote_storage import RemoteStorageKind
 from pytest_httpserver import HTTPServer
 
+if TYPE_CHECKING:
+    from fixtures.httpserver import ListenAddress
+
 # NB: basic config change tests are in test_tenant_conf.py
 
 
 def test_threshold_based_eviction(
     httpserver: HTTPServer,
-    httpserver_listen_address,
+    httpserver_listen_address: ListenAddress,
     pg_bin: PgBin,
     neon_env_builder: NeonEnvBuilder,
 ):
@@ -48,13 +53,12 @@ def test_threshold_based_eviction(
     tenant_id, timeline_id = env.initial_tenant, env.initial_timeline
 
     ps_http = env.pageserver.http_client()
-    assert ps_http.tenant_config(tenant_id).effective_config["eviction_policy"] == {
-        "kind": "NoEviction"
-    }
+    vps_http = env.storage_controller.pageserver_api()
+    assert vps_http.tenant_config(tenant_id).effective_config["eviction_policy"] is None
 
-    eviction_threshold = 5
-    eviction_period = 1
-    ps_http.set_tenant_config(
+    eviction_threshold = 10
+    eviction_period = 2
+    vps_http.set_tenant_config(
         tenant_id,
         {
             "eviction_policy": {
@@ -64,7 +68,7 @@ def test_threshold_based_eviction(
             },
         },
     )
-    assert ps_http.tenant_config(tenant_id).effective_config["eviction_policy"] == {
+    assert vps_http.tenant_config(tenant_id).effective_config["eviction_policy"] == {
         "kind": "LayerAccessThreshold",
         "threshold": f"{eviction_threshold}s",
         "period": f"{eviction_period}s",
@@ -73,7 +77,7 @@ def test_threshold_based_eviction(
     # restart because changing tenant config is not instant
     env.pageserver.restart()
 
-    assert ps_http.tenant_config(tenant_id).effective_config["eviction_policy"] == {
+    assert vps_http.tenant_config(tenant_id).effective_config["eviction_policy"] == {
         "kind": "LayerAccessThreshold",
         "threshold": f"{eviction_threshold}s",
         "period": f"{eviction_period}s",
@@ -81,7 +85,7 @@ def test_threshold_based_eviction(
 
     # create a bunch of L1s, only the least of which will need to be resident
     compaction_threshold = 3  # create L1 layers quickly
-    ps_http.patch_tenant_config_client_side(
+    vps_http.update_tenant_config(
         tenant_id,
         inserts={
             # Disable gc and compaction to avoid on-demand downloads from their side.
@@ -107,7 +111,7 @@ def test_threshold_based_eviction(
 
     # create a bunch of layers
     with env.endpoints.create_start("main", tenant_id=tenant_id) as pg:
-        pg_bin.run(["pgbench", "-i", "-s", "3", pg.connstr()])
+        pg_bin.run(["pgbench", "-i", "-I", "dtGvp", "-s", "3", pg.connstr()])
         last_flush_lsn_upload(env, pg, tenant_id, timeline_id)
     # wrap up and shutdown safekeepers so that no more layers will be created after the final checkpoint
     for sk in env.safekeepers:
@@ -117,8 +121,8 @@ def test_threshold_based_eviction(
     # wait for evictions and assert that they stabilize
     @dataclass
     class ByLocalAndRemote:
-        remote_layers: Set[str]
-        local_layers: Set[str]
+        remote_layers: set[str]
+        local_layers: set[str]
 
     class MapInfoProjection:
         def __init__(self, info: LayerMapInfo):
@@ -146,15 +150,16 @@ def test_threshold_based_eviction(
                 out += [f"  {remote} {layer.layer_file_name}"]
             return "\n".join(out)
 
+    stable_for: float = 0
     observation_window = 8 * eviction_threshold
     consider_stable_when_no_change_for_seconds = 3 * eviction_threshold
     poll_interval = eviction_threshold / 3
     started_waiting_at = time.time()
-    map_info_changes: List[Tuple[float, MapInfoProjection]] = []
+    map_info_changes: list[tuple[float, MapInfoProjection]] = []
     while time.time() - started_waiting_at < observation_window:
         current = (
             time.time(),
-            MapInfoProjection(ps_http.layer_map_info(tenant_id, timeline_id)),
+            MapInfoProjection(vps_http.layer_map_info(tenant_id, timeline_id)),
         )
         last = map_info_changes[-1] if map_info_changes else (0, None)
         if last[1] is None or current[1] != last[1]:
@@ -179,6 +184,6 @@ def test_threshold_based_eviction(
     assert len(post.remote_layers) > 0, "some layers should be evicted once it's stabilized"
     assert len(post.local_layers) > 0, "the imitate accesses should keep some layers resident"
 
-    assert env.pageserver.log_contains(
-        metrics_refused_log_line
+    assert (
+        env.pageserver.log_contains(metrics_refused_log_line) is not None
     ), "ensure the metrics collection worker ran"

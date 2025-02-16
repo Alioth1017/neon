@@ -1,26 +1,34 @@
+from __future__ import annotations
+
+import random
 from contextlib import closing
 
+import psycopg2.errors as pgerr
 import pytest
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnvBuilder
 from fixtures.remote_storage import s3_storage
-from fixtures.utils import wait_until
+from fixtures.utils import skip_in_debug_build, wait_until
 
 
 # Test restarting page server, while safekeeper and compute node keep
 # running.
-@pytest.mark.parametrize("generations", [True, False])
-def test_pageserver_restart(neon_env_builder: NeonEnvBuilder, generations: bool):
-    neon_env_builder.enable_generations = generations
+def test_pageserver_restart(neon_env_builder: NeonEnvBuilder):
     neon_env_builder.enable_pageserver_remote_storage(s3_storage())
-    neon_env_builder.enable_scrub_on_exit()
+
+    # We inject a delay of 15 seconds for tenant activation below.
+    # Hence, bump the max delay here to not skip over the activation.
+    neon_env_builder.pageserver_config_override = 'background_task_maximum_delay="20s"'
 
     env = neon_env_builder.init_start()
 
     endpoint = env.endpoints.create_start("main")
     pageserver_http = env.pageserver.http_client()
 
-    assert pageserver_http.get_metric_value("pageserver_tenant_manager_slots") == 1
+    assert (
+        pageserver_http.get_metric_value("pageserver_tenant_manager_slots", {"mode": "attached"})
+        == 1
+    )
 
     pg_conn = endpoint.connect()
     cur = pg_conn.cursor()
@@ -55,7 +63,10 @@ def test_pageserver_restart(neon_env_builder: NeonEnvBuilder, generations: bool)
     env.pageserver.start()
 
     # We reloaded our tenant
-    assert pageserver_http.get_metric_value("pageserver_tenant_manager_slots") == 1
+    assert (
+        pageserver_http.get_metric_value("pageserver_tenant_manager_slots", {"mode": "attached"})
+        == 1
+    )
 
     cur.execute("SELECT count(*) FROM foo")
     assert cur.fetchone() == (100000,)
@@ -64,7 +75,7 @@ def test_pageserver_restart(neon_env_builder: NeonEnvBuilder, generations: bool)
     # pageserver does if a compute node connects and sends a request for the tenant
     # while it's still in Loading state. (It waits for the loading to finish, and then
     # processes the request.)
-    tenant_load_delay_ms = 5000
+    tenant_load_delay_ms = 15000
     env.pageserver.stop()
     env.pageserver.start(
         extra_env_vars={"FAILPOINTS": f"before-attaching-tenant=return({tenant_load_delay_ms})"}
@@ -93,7 +104,7 @@ def test_pageserver_restart(neon_env_builder: NeonEnvBuilder, generations: bool)
 
         raise AssertionError("No 'complete' metric yet")
 
-    wait_until(30, 1.0, assert_complete)
+    wait_until(assert_complete)
 
     # Expectation callbacks: arg t is sample value, arg p is the previous phase's sample value
     expectations = [
@@ -143,28 +154,25 @@ def test_pageserver_restart(neon_env_builder: NeonEnvBuilder, generations: bool)
 # Test that repeatedly kills and restarts the page server, while the
 # safekeeper and compute node keep running.
 @pytest.mark.timeout(540)
-def test_pageserver_chaos(neon_env_builder: NeonEnvBuilder, build_type: str):
-    if build_type == "debug":
-        pytest.skip("times out in debug builds")
-
+@pytest.mark.parametrize("shard_count", [None, 4])
+@skip_in_debug_build("times out in debug builds")
+def test_pageserver_chaos(neon_env_builder: NeonEnvBuilder, shard_count: int | None):
+    # same rationale as with the immediate stop; we might leave orphan layers behind.
+    neon_env_builder.disable_scrub_on_exit()
     neon_env_builder.enable_pageserver_remote_storage(s3_storage())
-    neon_env_builder.enable_scrub_on_exit()
+    if shard_count is not None:
+        neon_env_builder.num_pageservers = shard_count
 
-    env = neon_env_builder.init_start()
-
-    # these can happen, if we shutdown at a good time. to be fixed as part of #5172.
-    message = ".*duplicated L1 layer layer=.*"
-    env.pageserver.allowed_errors.append(message)
+    env = neon_env_builder.init_start(initial_tenant_shard_count=shard_count)
 
     # Use a tiny checkpoint distance, to create a lot of layers quickly.
     # That allows us to stress the compaction and layer flushing logic more.
-    tenant, _ = env.neon_cli.create_tenant(
+    tenant, _ = env.create_tenant(
         conf={
             "checkpoint_distance": "5000000",
         }
     )
-    env.neon_cli.create_timeline("test_pageserver_chaos", tenant_id=tenant)
-    endpoint = env.endpoints.create_start("test_pageserver_chaos", tenant_id=tenant)
+    endpoint = env.endpoints.create_start("main", tenant_id=tenant)
 
     # Create table, and insert some rows. Make it big enough that it doesn't fit in
     # shared_buffers, otherwise the SELECT after restart will just return answer
@@ -194,14 +202,68 @@ def test_pageserver_chaos(neon_env_builder: NeonEnvBuilder, build_type: str):
             log.info(f"shared_buffers is {row[0]}, table size {row[1]}")
             assert int(row[0]) < int(row[1])
 
+    # We run "random" kills using a fixed seed, to improve reproducibility if a test
+    # failure is related to a particular order of operations.
+    seed = 0xDEADBEEF
+    rng = random.Random(seed)
+
     # Update the whole table, then immediately kill and restart the pageserver
     for i in range(1, 15):
         endpoint.safe_psql("UPDATE foo set updates = updates + 1")
 
         # This kills the pageserver immediately, to simulate a crash
-        env.pageserver.stop(immediate=True)
-        env.pageserver.start()
+        to_kill = rng.choice(env.pageservers)
+        to_kill.stop(immediate=True)
+        to_kill.start()
 
         # Check that all the updates are visible
         num_updates = endpoint.safe_psql("SELECT sum(updates) FROM foo")[0][0]
         assert num_updates == i * 100000
+
+    # currently pageserver cannot tolerate the fact that "s3" goes away, and if
+    # we succeeded in a compaction before shutdown, there might be a lot of
+    # uploads pending, certainly more than what we can ingest with MOCK_S3
+    #
+    # so instead, do a fast shutdown for this one test.
+    # See https://github.com/neondatabase/neon/issues/8709
+    env.stop(immediate=True)
+
+
+def test_pageserver_lost_and_transaction_aborted(neon_env_builder: NeonEnvBuilder):
+    """
+    If pageserver is unavailable during a transaction abort and target relation is
+    not present in cache, we abort the transaction in ABORT state which triggers a sigabrt.
+    This is _expected_ behavour
+    """
+    env = neon_env_builder.init_start()
+    endpoint = env.endpoints.create_start("main", config_lines=["neon.relsize_hash_size=0"])
+    with closing(endpoint.connect()) as conn, conn.cursor() as cur:
+        cur.execute("CREATE DATABASE test")
+    with (
+        pytest.raises((pgerr.InterfaceError, pgerr.InternalError)),
+        endpoint.connect(dbname="test") as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute("create table t(b box)")
+        env.pageserver.stop()
+        cur.execute("create index ti on t using gist(b)")
+
+
+def test_pageserver_lost_and_transaction_committed(neon_env_builder: NeonEnvBuilder):
+    """
+    If pageserver is unavailable during a transaction commit and target relation is
+    not present in cache, we abort the transaction in COMMIT state which triggers a sigabrt.
+    This is _expected_ behavour
+    """
+    env = neon_env_builder.init_start()
+    endpoint = env.endpoints.create_start("main", config_lines=["neon.relsize_hash_size=0"])
+    with closing(endpoint.connect()) as conn, conn.cursor() as cur:
+        cur.execute("CREATE DATABASE test")
+    with (
+        pytest.raises((pgerr.InterfaceError, pgerr.InternalError)),
+        endpoint.connect(dbname="test") as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute("create table t(t boolean)")
+        env.pageserver.stop()
+        cur.execute("drop table t")

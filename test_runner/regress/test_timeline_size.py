@@ -1,25 +1,28 @@
+from __future__ import annotations
+
+import concurrent.futures
 import math
-import queue
 import random
-import threading
 import time
+from collections import defaultdict
 from contextlib import closing
 from pathlib import Path
-from typing import Optional
 
 import psycopg2.errors
 import psycopg2.extras
 import pytest
+from fixtures.common_types import TenantId, TimelineId
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
     Endpoint,
     NeonEnv,
     NeonEnvBuilder,
+    NeonPageserver,
     PgBin,
     VanillaPostgres,
     wait_for_last_flush_lsn,
 )
-from fixtures.pageserver.http import PageserverApiException, PageserverHttpClient
+from fixtures.pageserver.http import PageserverHttpClient
 from fixtures.pageserver.utils import (
     assert_tenant_state,
     timeline_delete_wait_completed,
@@ -29,19 +32,17 @@ from fixtures.pageserver.utils import (
 from fixtures.pg_version import PgVersion
 from fixtures.port_distributor import PortDistributor
 from fixtures.remote_storage import RemoteStorageKind
-from fixtures.types import TenantId, TimelineId
 from fixtures.utils import get_timeline_dir_size, wait_until
 
 
 def test_timeline_size(neon_simple_env: NeonEnv):
     env = neon_simple_env
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_size", "empty")
+    new_timeline_id = env.create_branch("test_timeline_size", ancestor_branch_name="main")
 
     client = env.pageserver.http_client()
-    wait_for_timeline_size_init(client, tenant=env.initial_tenant, timeline=new_timeline_id)
+    client.timeline_wait_logical_size(env.initial_tenant, new_timeline_id)
 
     endpoint_main = env.endpoints.create_start("test_timeline_size")
-    log.info("postgres is running on 'test_timeline_size' branch")
 
     with closing(endpoint_main.connect()) as conn:
         with conn.cursor() as cur:
@@ -68,16 +69,17 @@ def test_timeline_size(neon_simple_env: NeonEnv):
 
 def test_timeline_size_createdropdb(neon_simple_env: NeonEnv):
     env = neon_simple_env
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_size_createdropdb", "empty")
+    new_timeline_id = env.create_branch(
+        "test_timeline_size_createdropdb", ancestor_branch_name="main"
+    )
 
     client = env.pageserver.http_client()
-    wait_for_timeline_size_init(client, tenant=env.initial_tenant, timeline=new_timeline_id)
+    client.timeline_wait_logical_size(env.initial_tenant, new_timeline_id)
     timeline_details = client.timeline_detail(
         env.initial_tenant, new_timeline_id, include_non_incremental_logical_size=True
     )
 
     endpoint_main = env.endpoints.create_start("test_timeline_size_createdropdb")
-    log.info("postgres is running on 'test_timeline_size_createdropdb' branch")
 
     with closing(endpoint_main.connect()) as conn:
         with conn.cursor() as cur:
@@ -149,18 +151,18 @@ def wait_for_pageserver_catchup(endpoint_main: Endpoint, polling_interval=1, tim
 def test_timeline_size_quota_on_startup(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
     client = env.pageserver.http_client()
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_size_quota_on_startup")
+    new_timeline_id = env.create_branch("test_timeline_size_quota_on_startup")
 
-    wait_for_timeline_size_init(client, tenant=env.initial_tenant, timeline=new_timeline_id)
+    client.timeline_wait_logical_size(env.initial_tenant, new_timeline_id)
+
+    size_limit_mb = 30
 
     endpoint_main = env.endpoints.create(
         "test_timeline_size_quota_on_startup",
         # Set small limit for the test
-        config_lines=["neon.max_cluster_size=30MB"],
+        config_lines=[f"neon.max_cluster_size={size_limit_mb}MB"],
     )
     endpoint_main.start()
-
-    log.info("postgres is running on 'test_timeline_size_quota_on_startup' branch")
 
     with closing(endpoint_main.connect()) as conn:
         with conn.cursor() as cur:
@@ -168,17 +170,39 @@ def test_timeline_size_quota_on_startup(neon_env_builder: NeonEnvBuilder):
 
             # Insert many rows. This query must fail because of space limit
             try:
-                for _i in range(5000):
-                    cur.execute(
-                        """
-                        INSERT INTO foo
-                            SELECT 'long string to consume some space' || g
-                            FROM generate_series(1, 100) g
-                    """
-                    )
 
-                # If we get here, the timeline size limit failed
-                log.error("Query unexpectedly succeeded")
+                def write_rows(count):
+                    for _i in range(count):
+                        cur.execute(
+                            """
+                            INSERT INTO foo
+                                SELECT 'long string to consume some space' || g
+                                FROM generate_series(1, 100) g
+                        """
+                        )
+
+                # Write some data that exceeds limit, then let the pageserver ingest it to guarantee that some feedback has made it to
+                # the safekeeper, then try to write some more.  We expect either the initial writes or the ones after
+                # the wait_for_last_flush_lsn to generate an exception.
+                #
+                # Without the wait_for_last_flush_lsn, the size limit sometimes isn't enforced (see https://github.com/neondatabase/neon/issues/6562)
+                write_rows(2500)
+                wait_for_last_flush_lsn(env, endpoint_main, env.initial_tenant, new_timeline_id)
+                logical_size = env.pageserver.http_client().timeline_detail(
+                    env.initial_tenant, new_timeline_id
+                )["current_logical_size"]
+                assert logical_size > size_limit_mb * 1024 * 1024
+                write_rows(2500)
+
+                # If we get here, the timeline size limit failed.  Find out from the pageserver how large it
+                # thinks the timeline is.
+                wait_for_last_flush_lsn(env, endpoint_main, env.initial_tenant, new_timeline_id)
+                logical_size = env.pageserver.http_client().timeline_detail(
+                    env.initial_tenant, new_timeline_id
+                )["current_logical_size"]
+                log.error(
+                    f"Query unexpectedly succeeded, pageserver logical size is {logical_size}"
+                )
                 raise AssertionError()
 
             except psycopg2.errors.DiskFull as err:
@@ -215,9 +239,9 @@ def test_timeline_size_quota_on_startup(neon_env_builder: NeonEnvBuilder):
 def test_timeline_size_quota(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
     client = env.pageserver.http_client()
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_size_quota")
+    new_timeline_id = env.create_branch("test_timeline_size_quota")
 
-    wait_for_timeline_size_init(client, tenant=env.initial_tenant, timeline=new_timeline_id)
+    client.timeline_wait_logical_size(env.initial_tenant, new_timeline_id)
 
     endpoint_main = env.endpoints.create(
         "test_timeline_size_quota",
@@ -228,8 +252,6 @@ def test_timeline_size_quota(neon_env_builder: NeonEnvBuilder):
     # which is needed for pg_cluster_size() to work
     endpoint_main.respec(skip_pg_catalog_updates=False)
     endpoint_main.start()
-
-    log.info("postgres is running on 'test_timeline_size_quota' branch")
 
     with closing(endpoint_main.connect()) as conn:
         with conn.cursor() as cur:
@@ -335,41 +357,18 @@ def test_timeline_initial_logical_size_calculation_cancellation(
     assert_size_calculation_not_done()
 
     log.info(
-        f"try to delete the timeline using {deletion_method}, this should cancel size computation tasks and wait for them to finish"
+        f"delete the timeline using {deletion_method}, this should cancel size computation tasks and wait for them to finish"
     )
-    delete_timeline_success: queue.Queue[bool] = queue.Queue(maxsize=1)
 
-    def delete_timeline_thread_fn():
-        try:
-            if deletion_method == "tenant_detach":
-                client.tenant_detach(tenant_id)
-            elif deletion_method == "timeline_delete":
-                timeline_delete_wait_completed(client, tenant_id, timeline_id)
-            delete_timeline_success.put(True)
-        except PageserverApiException:
-            delete_timeline_success.put(False)
-            raise
+    if deletion_method == "tenant_detach":
+        client.tenant_detach(tenant_id)
+    elif deletion_method == "timeline_delete":
+        timeline_delete_wait_completed(client, tenant_id, timeline_id)
+    else:
+        raise RuntimeError(deletion_method)
 
-    delete_timeline_thread = threading.Thread(target=delete_timeline_thread_fn)
-    delete_timeline_thread.start()
-    # give it some time to settle in the state where it waits for size computation task
-    time.sleep(5)
-    if not delete_timeline_success.empty():
-        raise AssertionError(
-            f"test is broken, the {deletion_method} should be stuck waiting for size computation task, got result {delete_timeline_success.get()}"
-        )
-
-    log.info(
-        "resume the size calculation. The failpoint checks that the timeline directory still exists."
-    )
-    client.configure_failpoints(("timeline-calculate-logical-size-check-dir-exists", "return"))
-    client.configure_failpoints(("timeline-calculate-logical-size-pause", "off"))
-
-    log.info("wait for delete timeline thread to finish and assert that it succeeded")
-    assert delete_timeline_success.get()
-
-    # if the implementation is incorrect, the teardown would complain about an error log
-    # message emitted by the code behind failpoint "timeline-calculate-logical-size-check-dir-exists"
+    # timeline-calculate-logical-size-pause is still paused, but it doesn't
+    # matter because it's a pausable_failpoint, which can be cancelled by drop.
 
 
 def test_timeline_physical_size_init(neon_env_builder: NeonEnvBuilder):
@@ -377,7 +376,7 @@ def test_timeline_physical_size_init(neon_env_builder: NeonEnvBuilder):
 
     env = neon_env_builder.init_start()
 
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_physical_size_init")
+    new_timeline_id = env.create_branch("test_timeline_physical_size_init")
     endpoint = env.endpoints.create_start("test_timeline_physical_size_init")
 
     endpoint.safe_psql_many(
@@ -397,11 +396,7 @@ def test_timeline_physical_size_init(neon_env_builder: NeonEnvBuilder):
 
     # Wait for the tenant to be loaded
     client = env.pageserver.http_client()
-    wait_until(
-        number_of_iterations=5,
-        interval=1,
-        func=lambda: assert_tenant_state(client, env.initial_tenant, "Active"),
-    )
+    wait_until(lambda: assert_tenant_state(client, env.initial_tenant, "Active"))
 
     assert_physical_size_invariants(
         get_physical_size_values(env, env.initial_tenant, new_timeline_id),
@@ -414,7 +409,7 @@ def test_timeline_physical_size_post_checkpoint(neon_env_builder: NeonEnvBuilder
     env = neon_env_builder.init_start()
 
     pageserver_http = env.pageserver.http_client()
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_physical_size_post_checkpoint")
+    new_timeline_id = env.create_branch("test_timeline_physical_size_post_checkpoint")
     endpoint = env.endpoints.create_start("test_timeline_physical_size_post_checkpoint")
 
     endpoint.safe_psql_many(
@@ -434,7 +429,7 @@ def test_timeline_physical_size_post_checkpoint(neon_env_builder: NeonEnvBuilder
             get_physical_size_values(env, env.initial_tenant, new_timeline_id),
         )
 
-    wait_until(10, 1, check)
+    wait_until(check)
 
 
 def test_timeline_physical_size_post_compaction(neon_env_builder: NeonEnvBuilder):
@@ -442,14 +437,15 @@ def test_timeline_physical_size_post_compaction(neon_env_builder: NeonEnvBuilder
 
     # Disable background compaction as we don't want it to happen after `get_physical_size` request
     # and before checking the expected size on disk, which makes the assertion failed
-    neon_env_builder.pageserver_config_override = (
-        "tenant_config={checkpoint_distance=100000, compaction_period='10m'}"
+    env = neon_env_builder.init_start(
+        initial_tenant_conf={
+            "checkpoint_distance": "100000",
+            "compaction_period": "0s",
+        }
     )
-
-    env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
 
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_physical_size_post_compaction")
+    new_timeline_id = env.create_branch("test_timeline_physical_size_post_compaction")
     endpoint = env.endpoints.create_start("test_timeline_physical_size_post_compaction")
 
     # We don't want autovacuum to run on the table, while we are calculating the
@@ -489,12 +485,17 @@ def test_timeline_physical_size_post_gc(neon_env_builder: NeonEnvBuilder):
 
     # Disable background compaction and GC as we don't want it to happen after `get_physical_size` request
     # and before checking the expected size on disk, which makes the assertion failed
-    neon_env_builder.pageserver_config_override = "tenant_config={checkpoint_distance=100000, compaction_period='0s', gc_period='0s', pitr_interval='1s'}"
-
-    env = neon_env_builder.init_start()
+    env = neon_env_builder.init_start(
+        initial_tenant_conf={
+            "checkpoint_distance": "100000",
+            "compaction_period": "0s",
+            "gc_period": "0s",
+            "pitr_interval": "1s",
+        }
+    )
     pageserver_http = env.pageserver.http_client()
 
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_physical_size_post_gc")
+    new_timeline_id = env.create_branch("test_timeline_physical_size_post_gc")
     endpoint = env.endpoints.create_start("test_timeline_physical_size_post_gc")
 
     # Like in test_timeline_physical_size_post_compaction, disable autovacuum
@@ -541,7 +542,7 @@ def test_timeline_size_metrics(
     env = neon_simple_env
     pageserver_http = env.pageserver.http_client()
 
-    new_timeline_id = env.neon_cli.create_branch("test_timeline_size_metrics")
+    new_timeline_id = env.create_branch("test_timeline_size_metrics")
     endpoint = env.endpoints.create_start("test_timeline_size_metrics")
 
     endpoint.safe_psql_many(
@@ -583,7 +584,6 @@ def test_timeline_size_metrics(
     pg_bin = PgBin(test_output_dir, pg_distrib_dir, pg_version)
     port = port_distributor.get_port()
     with VanillaPostgres(pgdatadir, pg_bin, port) as vanilla_pg:
-        vanilla_pg.configure([f"port={port}"])
         vanilla_pg.start()
 
         # Create database based on template0 because we can't connect to template0
@@ -619,7 +619,7 @@ def test_tenant_physical_size(neon_env_builder: NeonEnvBuilder):
     pageserver_http = env.pageserver.http_client()
     client = env.pageserver.http_client()
 
-    tenant, timeline = env.neon_cli.create_tenant()
+    tenant, timeline = env.create_tenant()
 
     def get_timeline_resident_physical_size(timeline: TimelineId):
         sizes = get_physical_size_values(env, tenant, timeline)
@@ -630,7 +630,7 @@ def test_tenant_physical_size(neon_env_builder: NeonEnvBuilder):
     for i in range(10):
         n_rows = random.randint(100, 1000)
 
-        timeline = env.neon_cli.create_branch(f"test_tenant_physical_size_{i}", tenant_id=tenant)
+        timeline = env.create_branch(f"test_tenant_physical_size_{i}", tenant_id=tenant)
         endpoint = env.endpoints.create_start(f"test_tenant_physical_size_{i}", tenant_id=tenant)
 
         endpoint.safe_psql_many(
@@ -663,7 +663,7 @@ def test_tenant_physical_size(neon_env_builder: NeonEnvBuilder):
 class TimelinePhysicalSizeValues:
     api_current_physical: int
     prometheus_resident_physical: float
-    prometheus_remote_physical: Optional[float] = None
+    prometheus_remote_physical: float | None = None
     python_timelinedir_layerfiles_physical: int
     layer_map_file_size_sum: int
 
@@ -678,7 +678,7 @@ def get_physical_size_values(
     client = env.pageserver.http_client()
 
     res.layer_map_file_size_sum = sum(
-        layer.layer_file_size or 0
+        layer.layer_file_size
         for layer in client.layer_map_info(tenant_id, timeline_id).historic_layers
     )
 
@@ -713,26 +713,11 @@ def assert_physical_size_invariants(sizes: TimelinePhysicalSizeValues):
     # XXX would be nice to assert layer file physical storage utilization here as well, but we can only do that for LocalFS
 
 
-# Timeline logical size initialization is an asynchronous background task that runs once,
-# try a few times to ensure it's activated properly
-def wait_for_timeline_size_init(
-    client: PageserverHttpClient, tenant: TenantId, timeline: TimelineId
-):
-    for i in range(10):
-        timeline_details = client.timeline_detail(
-            tenant, timeline, include_non_incremental_logical_size=True
-        )
-        current_logical_size = timeline_details["current_logical_size"]
-        non_incremental = timeline_details["current_logical_size_non_incremental"]
-        if current_logical_size == non_incremental:
-            return
-        log.info(
-            f"waiting for current_logical_size of a timeline to be calculated, iteration {i}: {current_logical_size} vs {non_incremental}"
-        )
-        time.sleep(1)
-    raise Exception(
-        f"timed out while waiting for current_logical_size of a timeline to reach its non-incremental value, details: {timeline_details}"
-    )
+def wait_for_tenant_startup_completions(client: PageserverHttpClient, count: int):
+    def condition():
+        assert client.get_metric_value("pageserver_tenant_startup_complete_total") == count
+
+    wait_until(condition)
 
 
 def test_ondemand_activation(neon_env_builder: NeonEnvBuilder):
@@ -747,7 +732,7 @@ def test_ondemand_activation(neon_env_builder: NeonEnvBuilder):
 
     # We will run with the limit set to 1, so that once we have one tenant stuck
     # in a pausable failpoint, the rest are prevented from proceeding through warmup.
-    neon_env_builder.pageserver_config_override = "concurrent_tenant_warmup = '1'"
+    neon_env_builder.pageserver_config_override = "concurrent_tenant_warmup = 1"
 
     env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
@@ -757,15 +742,7 @@ def test_ondemand_activation(neon_env_builder: NeonEnvBuilder):
     tenant_ids = {env.initial_tenant}
     for _i in range(0, n_tenants - 1):
         tenant_id = TenantId.generate()
-        env.pageserver.tenant_create(tenant_id)
-
-        # Empty tenants are not subject to waiting for logical size calculations, because
-        # those hapen on timeline level
-        timeline_id = TimelineId.generate()
-        env.neon_cli.create_timeline(
-            new_branch_name="main", tenant_id=tenant_id, timeline_id=timeline_id
-        )
-
+        env.create_tenant(tenant_id)
         tenant_ids.add(tenant_id)
 
     # Restart pageserver with logical size calculations paused
@@ -776,6 +753,7 @@ def test_ondemand_activation(neon_env_builder: NeonEnvBuilder):
 
     def get_tenant_states():
         states = {}
+        log.info(f"Tenant ids: {tenant_ids}")
         for tenant_id in tenant_ids:
             tenant = pageserver_http.tenant_status(tenant_id=tenant_id)
             states[tenant_id] = tenant["state"]["slug"]
@@ -786,7 +764,7 @@ def test_ondemand_activation(neon_env_builder: NeonEnvBuilder):
         assert "Active" in set(get_tenant_states().values())
 
     # One tenant should activate, then get stuck in their logical size calculation
-    wait_until(10, 1, at_least_one_active)
+    wait_until(at_least_one_active)
 
     # Wait some walltime to gain confidence that other tenants really are stuck and not proceeding to activate
     time.sleep(5)
@@ -825,10 +803,7 @@ def test_ondemand_activation(neon_env_builder: NeonEnvBuilder):
     # That one that we successfully accessed is now Active
     expect_activated += 1
     assert pageserver_http.tenant_status(tenant_id=stuck_tenant_id)["state"]["slug"] == "Active"
-    assert (
-        pageserver_http.get_metric_value("pageserver_tenant_startup_complete_total")
-        == expect_activated - 1
-    )
+    wait_for_tenant_startup_completions(pageserver_http, count=expect_activated - 1)
 
     # The ones we didn't touch are still in Attaching
     assert (
@@ -848,10 +823,7 @@ def test_ondemand_activation(neon_env_builder: NeonEnvBuilder):
         == n_tenants - expect_activated
     )
 
-    assert (
-        pageserver_http.get_metric_value("pageserver_tenant_startup_complete_total")
-        == expect_activated - 1
-    )
+    wait_for_tenant_startup_completions(pageserver_http, count=expect_activated - 1)
 
     # When we unblock logical size calculation, all tenants should proceed to active state via
     # the warmup route.
@@ -860,15 +832,314 @@ def test_ondemand_activation(neon_env_builder: NeonEnvBuilder):
     def all_active():
         assert all(s == "Active" for s in get_tenant_states().values())
 
-    wait_until(10, 1, all_active)
+    wait_until(all_active)
 
     # Final control check: restarting with no failpoints at all results in all tenants coming active
     # without being prompted by client I/O
     env.pageserver.stop()
     env.pageserver.start()
-    wait_until(10, 1, all_active)
+    wait_until(all_active)
 
     assert (
         pageserver_http.get_metric_value("pageserver_tenant_startup_scheduled_total") == n_tenants
     )
-    assert pageserver_http.get_metric_value("pageserver_tenant_startup_complete_total") == n_tenants
+    wait_for_tenant_startup_completions(pageserver_http, count=n_tenants)
+
+    # Check that tenant deletion/detach proactively wakes tenants: this is done separately to the main
+    # body of the test because it will disrupt tenant counts
+    env.pageserver.stop()
+    env.pageserver.start(
+        extra_env_vars={"FAILPOINTS": "timeline-calculate-logical-size-pause=pause"}
+    )
+
+    wait_until(at_least_one_active)
+
+    detach_tenant_id = list(
+        [(tid, s) for (tid, s) in get_tenant_states().items() if s == "Attaching"]
+    )[0][0]
+    delete_tenant_id = list(
+        [(tid, s) for (tid, s) in get_tenant_states().items() if s == "Attaching"]
+    )[1][0]
+
+    # Detaching a stuck tenant should proceed promptly
+    # (reproducer for https://github.com/neondatabase/neon/pull/6430)
+    env.pageserver.http_client().tenant_detach(detach_tenant_id)
+    tenant_ids.remove(detach_tenant_id)
+    # FIXME: currently the mechanism for cancelling attach is to set state to broken, which is reported spuriously at error level
+    env.pageserver.allowed_errors.append(
+        ".*attach failed, setting tenant state to Broken: Shut down while Attaching"
+    )
+
+    # Deleting a stuck tenant should prompt it to go active
+    # in some cases, it has already been activated because it's behind the detach
+    delete_lazy_activating(delete_tenant_id, env.pageserver, expect_attaching=False)
+    tenant_ids.remove(delete_tenant_id)
+
+    # Check that all the stuck tenants proceed to active (apart from the one that deletes, and the one
+    # we detached)
+    wait_until(all_active)
+    assert len(get_tenant_states()) == n_tenants - 2
+
+
+def delete_lazy_activating(
+    delete_tenant_id: TenantId, pageserver: NeonPageserver, expect_attaching: bool
+):
+    pageserver_http = pageserver.http_client()
+
+    if expect_attaching:
+        assert pageserver_http.tenant_status(delete_tenant_id)["state"]["slug"] == "Attaching"
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        log.info("Starting background delete")
+
+        def shutting_down():
+            assert pageserver.log_contains(".*Waiting for timelines.*") is not None
+
+        def delete_tenant():
+            pageserver_http.tenant_delete(delete_tenant_id)
+
+        background_delete = executor.submit(delete_tenant)
+
+        # We expect deletion to enter shutdown of the tenant even though it's in the attaching state
+        try:
+            # Deletion will get to the point in shutdown where it's waiting for timeline shutdown, then
+            # hang because of our failpoint blocking activation.
+            wait_until(shutting_down)
+        finally:
+            log.info("Clearing failpoint")
+            pageserver_http.configure_failpoints(("timeline-calculate-logical-size-pause", "off"))
+
+        # Deletion should complete successfully now that failpoint is unblocked and shutdown can complete
+        log.info("Joining background delete")
+        background_delete.result(timeout=10)
+
+
+def test_timeline_logical_size_task_priority(neon_env_builder: NeonEnvBuilder):
+    """
+    /v1/tenant/:tenant_shard_id/timeline and /v1/tenant/:tenant_shard_id
+    should not bump the priority of the initial logical size computation
+    background task, unless the force-await-initial-logical-size query param
+    is set to true.
+
+    This test verifies the invariant stated above. A couple of tricks are involved:
+    1. Detach the tenant and re-attach it after the page server is restarted. This circumvents
+    the warm-up which forces the initial logical size calculation.
+    2. A fail point (initial-size-calculation-permit-pause) is used to block the initial
+    computation of the logical size until forced.
+    3. A fail point (walreceiver-after-ingest) is used to pause the walreceiver since
+    otherwise it would force the logical size computation.
+    """
+    env = neon_env_builder.init_start()
+    client = env.pageserver.http_client()
+
+    tenant_id = env.initial_tenant
+    timeline_id = env.initial_timeline
+
+    # just make sure this doesn't hit an assertion
+    client.timeline_detail(tenant_id, timeline_id, force_await_initial_logical_size=True)
+
+    # load in some data
+    endpoint = env.endpoints.create_start("main", tenant_id=tenant_id)
+    endpoint.safe_psql_many(
+        [
+            "CREATE TABLE foo (x INTEGER)",
+            "INSERT INTO foo SELECT g FROM generate_series(1, 10000) g",
+        ]
+    )
+    wait_for_last_flush_lsn(env, endpoint, tenant_id, timeline_id)
+
+    # restart with failpoint inside initial size calculation task
+    log.info(f"Detaching tenant {tenant_id} and stopping pageserver...")
+
+    endpoint.stop()
+    env.pageserver.tenant_detach(tenant_id)
+    env.pageserver.stop()
+    env.pageserver.start(
+        extra_env_vars={
+            "FAILPOINTS": "initial-size-calculation-permit-pause=pause;walreceiver-after-ingest=pause"
+        }
+    )
+
+    log.info(f"Re-attaching tenant {tenant_id}...")
+    env.pageserver.tenant_attach(tenant_id)
+
+    # kick off initial size calculation task (the response we get here is the estimated size)
+    def assert_initial_logical_size_not_prioritised():
+        details = client.timeline_detail(tenant_id, timeline_id)
+        assert details["current_logical_size_is_accurate"] is False
+
+    assert_initial_logical_size_not_prioritised()
+
+    # ensure that's actually the case
+    time.sleep(2)
+    assert_initial_logical_size_not_prioritised()
+
+    details = client.timeline_detail(tenant_id, timeline_id, force_await_initial_logical_size=True)
+    assert details["current_logical_size_is_accurate"] is True
+
+    client.configure_failpoints(
+        [("initial-size-calculation-permit-pause", "off"), ("walreceiver-after-ingest", "off")]
+    )
+
+
+def test_eager_attach_does_not_queue_up(neon_env_builder: NeonEnvBuilder):
+    neon_env_builder.pageserver_config_override = "concurrent_tenant_warmup = 1"
+
+    env = neon_env_builder.init_start()
+
+    # the supporting_second does nothing except queue behind env.initial_tenant
+    # for purposes of showing that eager_tenant breezes past the queue
+    supporting_second, _ = env.create_tenant()
+    eager_tenant, _ = env.create_tenant()
+
+    client = env.pageserver.http_client()
+    client.tenant_location_conf(
+        eager_tenant,
+        {
+            "mode": "Detached",
+            "secondary_conf": None,
+            "tenant_conf": {},
+            "generation": None,
+        },
+    )
+
+    env.pageserver.stop()
+
+    # pause at logical size calculation, also pause before walreceiver can give feedback so it will give priority to logical size calculation
+    env.pageserver.start(
+        extra_env_vars={
+            "FAILPOINTS": "timeline-calculate-logical-size-pause=pause;walreceiver-after-ingest=pause"
+        }
+    )
+
+    tenant_ids = [env.initial_tenant, supporting_second]
+
+    def get_tenant_states() -> dict[str, list[TenantId]]:
+        states = defaultdict(list)
+        for id in tenant_ids:
+            state = client.tenant_status(id)["state"]["slug"]
+            states[state].append(id)
+        return dict(states)
+
+    def one_is_active():
+        states = get_tenant_states()
+        log.info(f"{states}")
+        assert len(states["Active"]) == 1
+
+    wait_until(one_is_active)
+
+    def other_is_attaching():
+        states = get_tenant_states()
+        assert len(states["Attaching"]) == 1
+
+    wait_until(other_is_attaching)
+
+    def eager_tenant_is_active():
+        resp = client.tenant_status(eager_tenant)
+        assert resp["state"]["slug"] == "Active"
+
+    gen = env.storage_controller.attach_hook_issue(eager_tenant, env.pageserver.id)
+    client.tenant_location_conf(
+        eager_tenant,
+        {
+            "mode": "AttachedSingle",
+            "secondary_conf": None,
+            "tenant_conf": {},
+            "generation": gen,
+        },
+        lazy=False,
+    )
+    wait_until(eager_tenant_is_active)
+
+    other_is_attaching()
+
+    client.configure_failpoints(
+        [("timeline-calculate-logical-size-pause", "off"), ("walreceiver-after-ingest", "off")]
+    )
+
+
+@pytest.mark.parametrize("activation_method", ["endpoint", "branch", "delete"])
+def test_lazy_attach_activation(neon_env_builder: NeonEnvBuilder, activation_method: str):
+    # env.initial_tenant will take up this permit when attaching with lazy because of a failpoint activated after restart
+    neon_env_builder.pageserver_config_override = "concurrent_tenant_warmup = 1"
+
+    env = neon_env_builder.init_start()
+
+    # because this returns (also elsewhere in this file), we know that SpawnMode::Create skips the queue
+    lazy_tenant, _ = env.create_tenant()
+
+    client = env.pageserver.http_client()
+    client.tenant_location_conf(
+        lazy_tenant,
+        {
+            "mode": "Detached",
+            "secondary_conf": None,
+            "tenant_conf": {},
+            "generation": None,
+        },
+    )
+
+    env.pageserver.stop()
+
+    # pause at logical size calculation, also pause before walreceiver can give feedback so it will give priority to logical size calculation
+    env.pageserver.start(
+        extra_env_vars={
+            "FAILPOINTS": "timeline-calculate-logical-size-pause=pause;walreceiver-after-ingest=pause"
+        }
+    )
+
+    def initial_tenant_is_active():
+        resp = client.tenant_status(env.initial_tenant)
+        assert resp["state"]["slug"] == "Active"
+
+    wait_until(initial_tenant_is_active)
+
+    # even though the initial tenant is now active, because it was startup time
+    # attach, it will consume the only permit because logical size calculation
+    # is paused.
+
+    gen = env.storage_controller.attach_hook_issue(lazy_tenant, env.pageserver.id)
+    client.tenant_location_conf(
+        lazy_tenant,
+        {
+            "mode": "AttachedSingle",
+            "secondary_conf": None,
+            "tenant_conf": {},
+            "generation": gen,
+        },
+        lazy=True,
+    )
+
+    def lazy_tenant_is_attaching():
+        resp = client.tenant_status(lazy_tenant)
+        assert resp["state"]["slug"] == "Attaching"
+
+    # paused logical size calculation of env.initial_tenant is keeping it attaching
+    wait_until(lazy_tenant_is_attaching)
+
+    for _ in range(5):
+        lazy_tenant_is_attaching()
+        time.sleep(0.5)
+
+    def lazy_tenant_is_active():
+        resp = client.tenant_status(lazy_tenant)
+        assert resp["state"]["slug"] == "Active"
+
+    if activation_method == "endpoint":
+        with env.endpoints.create_start("main", tenant_id=lazy_tenant):
+            # starting up the endpoint should make it jump the queue
+            wait_until(lazy_tenant_is_active)
+    elif activation_method == "branch":
+        env.create_timeline("second_branch", lazy_tenant)
+        wait_until(lazy_tenant_is_active)
+    elif activation_method == "delete":
+        delete_lazy_activating(lazy_tenant, env.pageserver, expect_attaching=True)
+    else:
+        raise RuntimeError(activation_method)
+
+    client.configure_failpoints(
+        [
+            ("timeline-calculate-logical-size-pause", "off"),
+            ("walreceiver-after-ingest", "off"),
+        ]
+    )

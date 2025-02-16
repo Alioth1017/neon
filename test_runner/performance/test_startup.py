@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import requests
 from fixtures.benchmark_fixture import MetricReport, NeonBenchmarker
 from fixtures.neon_fixtures import NeonEnvBuilder
@@ -27,7 +29,7 @@ def test_startup_simple(neon_env_builder: NeonEnvBuilder, zenbenchmark: NeonBenc
     neon_env_builder.num_safekeepers = 3
     env = neon_env_builder.init_start()
 
-    env.neon_cli.create_branch("test_startup")
+    env.create_branch("test_startup")
 
     endpoint = None
 
@@ -54,7 +56,9 @@ def test_startup_simple(neon_env_builder: NeonEnvBuilder, zenbenchmark: NeonBenc
             endpoint.safe_psql("select 1;")
 
         # Get metrics
-        metrics = requests.get(f"http://localhost:{endpoint.http_port}/metrics.json").json()
+        metrics = requests.get(
+            f"http://localhost:{endpoint.external_http_port}/metrics.json"
+        ).json()
         durations = {
             "wait_for_spec_ms": f"{i}_wait_for_spec",
             "sync_safekeepers_ms": f"{i}_sync_safekeepers",

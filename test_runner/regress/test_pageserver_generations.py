@@ -9,33 +9,33 @@ of the pageserver are:
 - Updates to remote_consistent_lsn may only be made visible after validating generation
 """
 
+from __future__ import annotations
 
-import enum
-import re
+import os
 import time
-from typing import Optional
+from enum import StrEnum
 
 import pytest
+from fixtures.common_types import TenantId, TimelineId
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
     NeonEnv,
     NeonEnvBuilder,
     PgBin,
-    S3Scrubber,
-    last_flush_lsn_upload,
+    generate_uploads_and_deletions,
 )
+from fixtures.pageserver.common_types import parse_layer_file_name
 from fixtures.pageserver.http import PageserverApiException
 from fixtures.pageserver.utils import (
     assert_tenant_state,
-    list_prefix,
     wait_for_last_record_lsn,
     wait_for_upload,
 )
 from fixtures.remote_storage import (
+    LocalFsStorage,
     RemoteStorageKind,
 )
-from fixtures.types import TenantId, TimelineId
-from fixtures.utils import print_gc_result, wait_until
+from fixtures.utils import run_only_on_default_postgres, wait_until
 from fixtures.workload import Workload
 
 # A tenant configuration that is convenient for generating uploads and deletions
@@ -52,70 +52,13 @@ TENANT_CONF = {
     "compaction_period": "0s",
     # create image layers eagerly, so that GC can remove some layers
     "image_creation_threshold": "1",
+    "image_layer_creation_check_threshold": "0",
+    "lsn_lease_length": "0s",
 }
 
 
-def generate_uploads_and_deletions(
-    env: NeonEnv,
-    *,
-    init: bool = True,
-    tenant_id: Optional[TenantId] = None,
-    timeline_id: Optional[TimelineId] = None,
-    data: Optional[str] = None,
-):
-    """
-    Using the environment's default tenant + timeline, generate a load pattern
-    that results in some uploads and some deletions to remote storage.
-    """
-
-    if tenant_id is None:
-        tenant_id = env.initial_tenant
-    assert tenant_id is not None
-
-    if timeline_id is None:
-        timeline_id = env.initial_timeline
-    assert timeline_id is not None
-
-    ps_http = env.pageserver.http_client()
-
-    with env.endpoints.create_start("main", tenant_id=tenant_id) as endpoint:
-        if init:
-            endpoint.safe_psql("CREATE TABLE foo (id INTEGER PRIMARY KEY, val text)")
-            last_flush_lsn_upload(env, endpoint, tenant_id, timeline_id)
-
-        def churn(data):
-            endpoint.safe_psql_many(
-                [
-                    f"""
-                INSERT INTO foo (id, val)
-                SELECT g, '{data}'
-                FROM generate_series(1, 200) g
-                ON CONFLICT (id) DO UPDATE
-                SET val = EXCLUDED.val
-                """,
-                    # to ensure that GC can actually remove some layers
-                    "VACUUM foo",
-                ]
-            )
-            assert tenant_id is not None
-            assert timeline_id is not None
-            # We are waiting for uploads as well as local flush, in order to avoid leaving the system
-            # in a state where there are "future layers" in remote storage that will generate deletions
-            # after a restart.
-            last_flush_lsn_upload(env, endpoint, tenant_id, timeline_id)
-            ps_http.timeline_checkpoint(tenant_id, timeline_id)
-
-        # Compaction should generate some GC-elegible layers
-        for i in range(0, 2):
-            churn(f"{i if data is None else data}")
-
-        gc_result = ps_http.timeline_gc(tenant_id, timeline_id, 0)
-        print_gc_result(gc_result)
-        assert gc_result["layers_removed"] > 0
-
-
 def read_all(
-    env: NeonEnv, tenant_id: Optional[TenantId] = None, timeline_id: Optional[TimelineId] = None
+    env: NeonEnv, tenant_id: TenantId | None = None, timeline_id: TimelineId | None = None
 ):
     if tenant_id is None:
         tenant_id = env.initial_tenant
@@ -179,100 +122,20 @@ def assert_deletion_queue(ps_http, size_fn) -> None:
     assert size_fn(v) is True
 
 
-def test_generations_upgrade(neon_env_builder: NeonEnvBuilder):
-    """
-    Validate behavior when a pageserver is run without generation support enabled,
-    then started again after activating it:
-    - Before upgrade, no objects should have generation suffixes
-    - After upgrade, the bucket should contain a mixture.
-    - In both cases, postgres I/O should work.
-    """
-    neon_env_builder.enable_generations = True
-    neon_env_builder.enable_pageserver_remote_storage(
-        RemoteStorageKind.MOCK_S3,
-    )
-
-    env = neon_env_builder.init_configs()
-    env.broker.try_start()
-    for sk in env.safekeepers:
-        sk.start()
-    assert env.attachment_service is not None
-    env.attachment_service.start()
-
-    env.pageserver.start(overrides=('--pageserver-config-override=control_plane_api=""',))
-
-    env.neon_cli.create_tenant(
-        tenant_id=env.initial_tenant, conf=TENANT_CONF, timeline_id=env.initial_timeline
-    )
-    generate_uploads_and_deletions(env)
-
-    def parse_generation_suffix(key):
-        m = re.match(".+-([0-9a-zA-Z]{8})$", key)
-        if m is None:
-            return None
-        else:
-            log.info(f"match: {m}")
-            log.info(f"group: {m.group(1)}")
-            return int(m.group(1), 16)
-
-    pre_upgrade_keys = list(
-        [o["Key"] for o in list_prefix(neon_env_builder, delimiter="")["Contents"]]
-    )
-    for key in pre_upgrade_keys:
-        assert parse_generation_suffix(key) is None
-
-    env.pageserver.stop()
-
-    # Starting without the override that disabled control_plane_api
-    env.pageserver.start()
-
-    generate_uploads_and_deletions(env, init=False)
-
-    legacy_objects: list[str] = []
-    suffixed_objects = []
-    post_upgrade_keys = list(
-        [o["Key"] for o in list_prefix(neon_env_builder, delimiter="")["Contents"]]
-    )
-    for key in post_upgrade_keys:
-        log.info(f"post-upgrade key: {key}")
-        if parse_generation_suffix(key) is not None:
-            suffixed_objects.append(key)
-        else:
-            legacy_objects.append(key)
-
-    # Bucket now contains a mixture of suffixed and non-suffixed objects
-    assert len(suffixed_objects) > 0
-    assert len(legacy_objects) > 0
-
-    # Flush through deletions to get a clean state for scrub: we are implicitly validating
-    # that our generations-enabled pageserver was able to do deletions of layers
-    # from earlier which don't have a generation.
-    env.pageserver.http_client().deletion_queue_flush(execute=True)
-
-    assert get_deletion_queue_unexpected_errors(env.pageserver.http_client()) == 0
-
-    # Having written a mixture of generation-aware and legacy index_part.json,
-    # ensure the scrubber handles the situation as expected.
-    metadata_summary = S3Scrubber(
-        neon_env_builder.test_output_dir, neon_env_builder
-    ).scan_metadata()
-    assert metadata_summary["count"] == 1  # Scrubber should have seen our timeline
-    assert not metadata_summary["with_errors"]
-    assert not metadata_summary["with_warnings"]
-
-
 def test_deferred_deletion(neon_env_builder: NeonEnvBuilder):
-    neon_env_builder.enable_generations = True
     neon_env_builder.enable_pageserver_remote_storage(
         RemoteStorageKind.MOCK_S3,
     )
+    neon_env_builder.num_pageservers = 2
     env = neon_env_builder.init_start(initial_tenant_conf=TENANT_CONF)
-    assert env.attachment_service is not None
 
-    some_other_pageserver = 1234
-    ps_http = env.pageserver.http_client()
+    attached_to_id = env.storage_controller.locate(env.initial_tenant)[0]["node_id"]
+    main_pageserver = env.get_pageserver(attached_to_id)
+    other_pageserver = [p for p in env.pageservers if p.id != attached_to_id][0]
 
-    generate_uploads_and_deletions(env)
+    ps_http = main_pageserver.http_client()
+
+    generate_uploads_and_deletions(env, pageserver=main_pageserver)
 
     # Flush: pending deletions should all complete
     assert_deletion_queue(ps_http, lambda n: n > 0)
@@ -285,14 +148,10 @@ def test_deferred_deletion(neon_env_builder: NeonEnvBuilder):
     assert timeline["remote_consistent_lsn"] == timeline["remote_consistent_lsn_visible"]
     assert get_deletion_queue_dropped_lsn_updates(ps_http) == 0
 
-    env.pageserver.allowed_errors.extend(
-        [".*Dropped remote consistent LSN updates.*", ".*Dropping stale deletions.*"]
-    )
-
     # Now advance the generation in the control plane: subsequent validations
     # from the running pageserver will fail.  No more deletions should happen.
-    env.attachment_service.attach_hook_issue(env.initial_tenant, some_other_pageserver)
-    generate_uploads_and_deletions(env, init=False)
+    env.storage_controller.attach_hook_issue(env.initial_tenant, other_pageserver.id)
+    generate_uploads_and_deletions(env, init=False, pageserver=main_pageserver)
 
     assert_deletion_queue(ps_http, lambda n: n > 0)
     queue_depth_before = get_deletion_queue_depth(ps_http)
@@ -317,12 +176,12 @@ def test_deferred_deletion(neon_env_builder: NeonEnvBuilder):
     assert get_deletion_queue_unexpected_errors(ps_http) == 0
 
 
-class KeepAttachment(str, enum.Enum):
+class KeepAttachment(StrEnum):
     KEEP = "keep"
     LOSE = "lose"
 
 
-class ValidateBefore(str, enum.Enum):
+class ValidateBefore(StrEnum):
     VALIDATE = "validate"
     NO_VALIDATE = "no-validate"
 
@@ -341,13 +200,17 @@ def test_deletion_queue_recovery(
     :param validate_before: whether to wait for deletions to be validated before restart.  This
     makes them elegible to be executed after restart, if the same node keeps the attachment.
     """
-    neon_env_builder.enable_generations = True
     neon_env_builder.enable_pageserver_remote_storage(
         RemoteStorageKind.MOCK_S3,
     )
+    neon_env_builder.num_pageservers = 2
     env = neon_env_builder.init_start(initial_tenant_conf=TENANT_CONF)
 
-    ps_http = env.pageserver.http_client()
+    attached_to_id = env.storage_controller.locate(env.initial_tenant)[0]["node_id"]
+    main_pageserver = env.get_pageserver(attached_to_id)
+    other_pageserver = [p for p in env.pageservers if p.id != attached_to_id][0]
+
+    ps_http = main_pageserver.http_client()
 
     failpoints = [
         # Prevent deletion lists from being executed, to build up some backlog of deletions
@@ -357,14 +220,13 @@ def test_deletion_queue_recovery(
     if validate_before == ValidateBefore.NO_VALIDATE:
         failpoints.append(
             # Prevent deletion lists from being validated, we will test that they are
-            # dropped properly during recovery.  'pause' is okay here because we kill
-            # the pageserver with immediate=true
-            ("control-plane-client-validate", "pause")
+            # dropped properly during recovery.  This is such a long sleep as to be equivalent to "never"
+            ("control-plane-client-validate", "return(3600000)")
         )
 
     ps_http.configure_failpoints(failpoints)
 
-    generate_uploads_and_deletions(env)
+    generate_uploads_and_deletions(env, pageserver=main_pageserver)
 
     # There should be entries in the deletion queue
     assert_deletion_queue(ps_http, lambda n: n > 0)
@@ -385,15 +247,15 @@ def test_deletion_queue_recovery(
         def assert_some_validations():
             assert get_deletion_queue_validated(ps_http) > 0
 
-        wait_until(20, 1, assert_some_validations)
+        wait_until(assert_some_validations)
 
         # The validatated keys statistic advances before the header is written, so we
         # also wait to see the header hit the disk: this seems paranoid but the race
         # can really happen on a heavily overloaded test machine.
         def assert_header_written():
-            assert (env.pageserver.workdir / "deletion" / "header-01").exists()
+            assert (main_pageserver.workdir / "deletion" / "header-01").exists()
 
-        wait_until(20, 1, assert_header_written)
+        wait_until(assert_header_written)
 
         # If we will lose attachment, then our expectation on restart is that only the ones
         # we already validated will execute.  Act like only those were present in the queue.
@@ -401,26 +263,25 @@ def test_deletion_queue_recovery(
             before_restart_depth = get_deletion_queue_validated(ps_http)
 
     log.info(f"Restarting pageserver with {before_restart_depth} deletions enqueued")
-    env.pageserver.stop(immediate=True)
+    main_pageserver.stop(immediate=True)
 
     if keep_attachment == KeepAttachment.LOSE:
-        some_other_pageserver = 101010
-        assert env.attachment_service is not None
-        env.attachment_service.attach_hook_issue(env.initial_tenant, some_other_pageserver)
+        some_other_pageserver = other_pageserver.id
+        env.storage_controller.attach_hook_issue(env.initial_tenant, some_other_pageserver)
 
-    env.pageserver.start()
+    main_pageserver.start()
 
-    def assert_deletions_submitted(n: int):
+    def assert_deletions_submitted(n: int) -> None:
         assert ps_http.get_metric_value("pageserver_deletion_queue_submitted_total") == n
 
     # After restart, issue a flush to kick the deletion frontend to do recovery.
     # It should recover all the operations we submitted before the restart.
     ps_http.deletion_queue_flush(execute=False)
-    wait_until(20, 0.25, lambda: assert_deletions_submitted(before_restart_depth))
+    wait_until(lambda: assert_deletions_submitted(before_restart_depth))
 
     # The queue should drain through completely if we flush it
     ps_http.deletion_queue_flush(execute=True)
-    wait_until(10, 1, lambda: assert_deletion_queue(ps_http, lambda n: n == 0))
+    wait_until(lambda: assert_deletion_queue(ps_http, lambda n: n == 0))
 
     if keep_attachment == KeepAttachment.KEEP:
         # - If we kept the attachment, then our pre-restart deletions should execute
@@ -431,8 +292,6 @@ def test_deletion_queue_recovery(
         #   validated before restart.
         assert get_deletion_queue_executed(ps_http) == before_restart_depth
     else:
-        env.pageserver.allowed_errors.extend([".*Dropping stale deletions.*"])
-
         # If we lost the attachment, we should have dropped our pre-restart deletions.
         assert get_deletion_queue_dropped(ps_http) == before_restart_depth
 
@@ -440,8 +299,8 @@ def test_deletion_queue_recovery(
     assert get_deletion_queue_dropped_lsn_updates(ps_http) == 0
 
     # Restart again
-    env.pageserver.stop(immediate=True)
-    env.pageserver.start()
+    main_pageserver.stop(immediate=True)
+    main_pageserver.start()
 
     # No deletion lists should be recovered: this demonstrates that deletion lists
     # were cleaned up after being executed or dropped in the previous process lifetime.
@@ -453,7 +312,6 @@ def test_deletion_queue_recovery(
 
 
 def test_emergency_mode(neon_env_builder: NeonEnvBuilder, pg_bin: PgBin):
-    neon_env_builder.enable_generations = True
     neon_env_builder.enable_pageserver_remote_storage(
         RemoteStorageKind.MOCK_S3,
     )
@@ -461,7 +319,7 @@ def test_emergency_mode(neon_env_builder: NeonEnvBuilder, pg_bin: PgBin):
 
     ps_http = env.pageserver.http_client()
 
-    generate_uploads_and_deletions(env)
+    generate_uploads_and_deletions(env, pageserver=env.pageserver)
 
     env.pageserver.allowed_errors.extend(
         [
@@ -473,13 +331,12 @@ def test_emergency_mode(neon_env_builder: NeonEnvBuilder, pg_bin: PgBin):
     )
 
     # Simulate a major incident: the control plane goes offline
-    assert env.attachment_service is not None
-    env.attachment_service.stop()
+    env.storage_controller.stop()
 
     # Remember how many validations had happened before the control plane went offline
     validated = get_deletion_queue_validated(ps_http)
 
-    generate_uploads_and_deletions(env, init=False)
+    generate_uploads_and_deletions(env, init=False, pageserver=env.pageserver)
 
     # The running pageserver should stop progressing deletions
     time.sleep(10)
@@ -489,12 +346,19 @@ def test_emergency_mode(neon_env_builder: NeonEnvBuilder, pg_bin: PgBin):
     # incident, but it might be unavoidable: if so, we want to be able to start up
     # and serve clients.
     env.pageserver.stop()  # Non-immediate: implicitly checking that shutdown doesn't hang waiting for CP
-    env.pageserver.start(
-        overrides=("--pageserver-config-override=control_plane_emergency_mode=true",)
+    replaced = env.pageserver.patch_config_toml_nonrecursive(
+        {
+            "control_plane_emergency_mode": True,
+        }
     )
+    env.pageserver.start()
 
     # The pageserver should provide service to clients
-    generate_uploads_and_deletions(env, init=False)
+    # Because it is in emergency mode, it will not attempt to validate deletions required by the initial barrier, and therefore
+    # other files cannot be uploaded b/c it's waiting for the initial barrier to be validated.
+    generate_uploads_and_deletions(
+        env, init=False, pageserver=env.pageserver, wait_until_uploaded=False
+    )
 
     # The pageserver should neither validate nor execute any deletions, it should have
     # loaded the DeletionLists from before though
@@ -504,7 +368,7 @@ def test_emergency_mode(neon_env_builder: NeonEnvBuilder, pg_bin: PgBin):
     assert get_deletion_queue_executed(ps_http) == 0
 
     # When the control plane comes back up, normal service should resume
-    env.attachment_service.start()
+    env.storage_controller.start()
 
     ps_http.deletion_queue_flush(execute=True)
     assert get_deletion_queue_depth(ps_http) == 0
@@ -513,9 +377,10 @@ def test_emergency_mode(neon_env_builder: NeonEnvBuilder, pg_bin: PgBin):
 
     # The pageserver should work fine when subsequently restarted in non-emergency mode
     env.pageserver.stop()  # Non-immediate: implicitly checking that shutdown doesn't hang waiting for CP
+    env.pageserver.patch_config_toml_nonrecursive(replaced)
     env.pageserver.start()
 
-    generate_uploads_and_deletions(env, init=False)
+    generate_uploads_and_deletions(env, init=False, pageserver=env.pageserver)
     ps_http.deletion_queue_flush(execute=True)
     assert get_deletion_queue_depth(ps_http) == 0
     assert get_deletion_queue_validated(ps_http) > 0
@@ -545,7 +410,6 @@ def test_eviction_across_generations(neon_env_builder: NeonEnvBuilder):
     and must be constructed using the proper generation for the layer, which may not be the same generation
     that the tenant is running in.
     """
-    neon_env_builder.enable_generations = True
     neon_env_builder.enable_pageserver_remote_storage(
         RemoteStorageKind.MOCK_S3,
     )
@@ -554,7 +418,7 @@ def test_eviction_across_generations(neon_env_builder: NeonEnvBuilder):
     tenant_id = env.initial_tenant
     timeline_id = env.initial_timeline
 
-    generate_uploads_and_deletions(env)
+    generate_uploads_and_deletions(env, pageserver=env.pageserver)
 
     read_all(env, tenant_id, timeline_id)
     evict_all_layers(env, tenant_id, timeline_id)
@@ -575,7 +439,6 @@ def test_multi_attach(
     neon_env_builder: NeonEnvBuilder,
     pg_bin: PgBin,
 ):
-    neon_env_builder.enable_generations = True
     neon_env_builder.num_pageservers = 3
     neon_env_builder.enable_pageserver_remote_storage(
         remote_storage_kind=RemoteStorageKind.MOCK_S3,
@@ -587,15 +450,16 @@ def test_multi_attach(
     tenant_id = env.initial_tenant
     timeline_id = env.initial_timeline
 
-    # We will intentionally create situations where stale deletions happen from non-latest-generation
-    # nodes when the tenant is multiply-attached
-    for ps in env.pageservers:
-        ps.allowed_errors.extend(
-            [".*Dropped remote consistent LSN updates.*", ".*Dropping stale deletions.*"]
-        )
+    # Instruct the storage controller to not interfere with our low level configuration
+    # of the pageserver's attachment states.  Otherwise when it sees nodes go offline+return,
+    # it would send its own requests that would conflict with the test's.
+    env.storage_controller.tenant_policy_update(tenant_id, {"scheduling": "Stop"})
+    env.storage_controller.allowed_errors.extend(
+        [".*Scheduling is disabled by policy Stop.*", ".*Skipping reconcile for policy Stop.*"]
+    )
 
     # Initially, the tenant will be attached to the first pageserver (first is default in our test harness)
-    wait_until(10, 0.2, lambda: assert_tenant_state(http_clients[0], tenant_id, "Active"))
+    wait_until(lambda: assert_tenant_state(http_clients[0], tenant_id, "Active"))
     _detail = http_clients[0].timeline_detail(tenant_id, timeline_id)
     with pytest.raises(PageserverApiException):
         http_clients[1].timeline_detail(tenant_id, timeline_id)
@@ -610,8 +474,8 @@ def test_multi_attach(
     pageservers[1].tenant_attach(env.initial_tenant)
     pageservers[2].tenant_attach(env.initial_tenant)
 
-    wait_until(10, 0.2, lambda: assert_tenant_state(http_clients[1], tenant_id, "Active"))
-    wait_until(10, 0.2, lambda: assert_tenant_state(http_clients[2], tenant_id, "Active"))
+    wait_until(lambda: assert_tenant_state(http_clients[1], tenant_id, "Active"))
+    wait_until(lambda: assert_tenant_state(http_clients[2], tenant_id, "Active"))
 
     # Now they all have it attached
     _details = list([c.timeline_detail(tenant_id, timeline_id) for c in http_clients])
@@ -644,16 +508,183 @@ def test_multi_attach(
     for ps in pageservers:
         ps.stop()
 
-    # Returning to a normal healthy state: all pageservers will start, but only the one most
-    # recently attached via the control plane will re-attach on startup
+    # Returning to a normal healthy state: all pageservers will start
     for ps in pageservers:
         ps.start()
 
-    with pytest.raises(PageserverApiException):
-        _detail = http_clients[0].timeline_detail(tenant_id, timeline_id)
-    with pytest.raises(PageserverApiException):
-        _detail = http_clients[1].timeline_detail(tenant_id, timeline_id)
-    _detail = http_clients[2].timeline_detail(tenant_id, timeline_id)
+    # Pageservers are marked offline by the storage controller during the rolling restart
+    # above. This may trigger a reschedulling, so there's no guarantee that the tenant
+    # shard ends up attached to the most recent ps.
+    raised = 0
+    serving_ps_idx = None
+    for idx, http_client in enumerate(http_clients):
+        try:
+            _detail = http_client.timeline_detail(tenant_id, timeline_id)
+            serving_ps_idx = idx
+        except PageserverApiException:
+            raised += 1
+
+    assert raised == 2 and serving_ps_idx is not None
 
     # All data we wrote while multi-attached remains readable
-    workload.validate(pageservers[2].id)
+    workload.validate(pageservers[serving_ps_idx].id)
+
+
+def test_upgrade_generationless_local_file_paths(
+    neon_env_builder: NeonEnvBuilder,
+):
+    """
+    Test pageserver behavior when startup up with local layer paths without
+    generation numbers: it should accept these layer files, and avoid doing
+    a delete/download cycle on them.
+    """
+    neon_env_builder.num_pageservers = 2
+    env = neon_env_builder.init_configs()
+    env.start()
+
+    tenant_id = TenantId.generate()
+    timeline_id = TimelineId.generate()
+    env.create_tenant(tenant_id, timeline_id, conf=TENANT_CONF, placement_policy='{"Attached":1}')
+
+    workload = Workload(env, tenant_id, timeline_id)
+    workload.init()
+    workload.write_rows(1000)
+
+    attached_pageserver = env.get_tenant_pageserver(tenant_id)
+    assert attached_pageserver is not None
+    secondary_pageserver = list([ps for ps in env.pageservers if ps.id != attached_pageserver.id])[
+        0
+    ]
+
+    attached_pageserver.http_client().tenant_heatmap_upload(tenant_id)
+    secondary_pageserver.http_client().tenant_secondary_download(tenant_id)
+
+    # Rename the local paths to legacy format, to simulate what
+    # we would see when upgrading.  Do this on both attached and secondary locations, as we will
+    # test the behavior of both.
+    for pageserver in env.pageservers:
+        pageserver.stop()
+        timeline_dir = pageserver.timeline_dir(tenant_id, timeline_id)
+        files_renamed = 0
+        log.info(f"Renaming files in {timeline_dir}")
+        for filename in os.listdir(timeline_dir):
+            if filename.endswith("-v1-00000001"):
+                new_filename = filename[:-12]
+                os.rename(
+                    os.path.join(timeline_dir, filename), os.path.join(timeline_dir, new_filename)
+                )
+                log.info(f"Renamed {filename} -> {new_filename}")
+                files_renamed += 1
+            else:
+                log.info(f"Keeping {filename}")
+
+        assert files_renamed > 0
+
+        pageserver.start()
+
+    workload.validate()
+
+    # Assert that there were no on-demand downloads
+    assert (
+        attached_pageserver.http_client().get_metric_value(
+            "pageserver_remote_ondemand_downloaded_layers_total"
+        )
+        == 0
+    )
+
+    # Do a secondary download and ensure there were no layer downloads
+    secondary_pageserver.http_client().tenant_secondary_download(tenant_id)
+    assert (
+        secondary_pageserver.http_client().get_metric_value(
+            "pageserver_secondary_download_layer_total"
+        )
+        == 0
+    )
+
+    # Check that when we evict and promote one of the legacy-named layers, everything works as
+    # expected
+    local_layers = list(
+        (
+            parse_layer_file_name(path.name),
+            os.path.join(attached_pageserver.timeline_dir(tenant_id, timeline_id), path),
+        )
+        for path in attached_pageserver.list_layers(tenant_id, timeline_id)
+    )
+    (victim_layer_name, victim_path) = local_layers[0]
+    assert os.path.exists(victim_path)
+
+    attached_pageserver.http_client().evict_layer(
+        tenant_id, timeline_id, victim_layer_name.to_str()
+    )
+    assert not os.path.exists(victim_path)
+
+    attached_pageserver.http_client().download_layer(
+        tenant_id, timeline_id, victim_layer_name.to_str()
+    )
+    # We should download into the same local path we started with
+    assert os.path.exists(victim_path)
+
+
+@run_only_on_default_postgres("Only tests index logic")
+def test_old_index_time_threshold(
+    neon_env_builder: NeonEnvBuilder,
+):
+    """
+    Exercise pageserver's detection of trying to load an ancient non-latest index.
+    (see https://github.com/neondatabase/neon/issues/6951)
+    """
+
+    # Run with local_fs because we will interfere with mtimes by local filesystem access
+    neon_env_builder.enable_pageserver_remote_storage(RemoteStorageKind.LOCAL_FS)
+    env = neon_env_builder.init_start()
+    tenant_id = env.initial_tenant
+    timeline_id = env.initial_timeline
+
+    workload = Workload(env, tenant_id, timeline_id)
+    workload.init()
+    workload.write_rows(32)
+
+    # Remember generation 1's index path
+    assert isinstance(env.pageserver_remote_storage, LocalFsStorage)
+    index_path = env.pageserver_remote_storage.index_path(tenant_id, timeline_id)
+
+    # Increment generation by detaching+attaching, and write+flush some data to get a new remote index
+    env.storage_controller.tenant_policy_update(tenant_id, {"placement": "Detached"})
+    env.storage_controller.tenant_policy_update(tenant_id, {"placement": {"Attached": 0}})
+    env.storage_controller.reconcile_until_idle()
+    workload.churn_rows(32)
+
+    # A new index should have been written
+    assert env.pageserver_remote_storage.index_path(tenant_id, timeline_id) != index_path
+
+    # Hack the mtime on the generation 1 index
+    log.info(f"Setting old mtime on {index_path}")
+    os.utime(index_path, times=(time.time(), time.time() - 30 * 24 * 3600))
+    env.pageserver.allowed_errors.extend(
+        [
+            ".*Found a newer index while loading an old one.*",
+            ".*Index age exceeds threshold and a newer index exists.*",
+        ]
+    )
+
+    # Detach from storage controller + attach in an old generation directly on the pageserver.
+    workload.stop()
+    env.storage_controller.tenant_policy_update(tenant_id, {"placement": "Detached"})
+    env.storage_controller.reconcile_until_idle()
+    env.storage_controller.tenant_policy_update(tenant_id, {"scheduling": "Stop"})
+    env.storage_controller.allowed_errors.append(".*Scheduling is disabled by policy")
+
+    # The controller would not do this (attach in an old generation): we are doing it to simulate
+    # a hypothetical profound bug in the controller.
+    env.pageserver.http_client().tenant_location_conf(
+        tenant_id, {"generation": 1, "mode": "AttachedSingle", "tenant_conf": {}}
+    )
+
+    # The pageserver should react to this situation by refusing to attach the tenant and putting
+    # it into Broken state
+    env.pageserver.allowed_errors.append(".*tenant is broken.*")
+    with pytest.raises(
+        PageserverApiException,
+        match="tenant is broken: Index age exceeds threshold and a newer index exists",
+    ):
+        env.pageserver.http_client().timeline_detail(tenant_id, timeline_id)

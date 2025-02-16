@@ -1,18 +1,27 @@
+from __future__ import annotations
+
 import os
 import shutil
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Dict
+from typing import TYPE_CHECKING
 
 import pytest
 from fixtures.log_helper import log
+from fixtures.metrics import parse_metrics
 from fixtures.neon_fixtures import (
     NeonEnvBuilder,
 )
 from fixtures.pg_version import PgVersion
+from fixtures.utils import skip_on_postgres
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers.request import Request
 from werkzeug.wrappers.response import Response
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from fixtures.httpserver import ListenAddress
 
 
 # use neon_env_builder_local fixture to override the default neon_env_builder fixture
@@ -36,15 +45,14 @@ def neon_env_builder_local(
     return neon_env_builder
 
 
+@skip_on_postgres(PgVersion.V16, reason="TODO: PG16 extension building")
+@skip_on_postgres(PgVersion.V17, reason="TODO: PG17 extension building")
 def test_remote_extensions(
     httpserver: HTTPServer,
     neon_env_builder_local: NeonEnvBuilder,
-    httpserver_listen_address,
-    pg_version,
+    httpserver_listen_address: ListenAddress,
+    pg_version: PgVersion,
 ):
-    if pg_version == PgVersion.V16:
-        pytest.skip("TODO: PG16 extension building")
-
     # setup mock http server
     # that expects request for anon.tar.zst
     # and returns the requested file
@@ -67,7 +75,7 @@ def test_remote_extensions(
             mimetype="application/octet-stream",
             headers=[
                 ("Content-Length", str(file_size)),
-                ("Content-Disposition", 'attachment; filename="%s"' % file_name),
+                ("Content-Disposition", f'attachment; filename="{file_name}"'),
             ],
             direct_passthrough=True,
         )
@@ -79,14 +87,16 @@ def test_remote_extensions(
     # Start a compute node with remote_extension spec
     # and check that it can download the extensions and use them to CREATE EXTENSION.
     env = neon_env_builder_local.init_start()
-    env.neon_cli.create_branch("test_remote_extensions")
+    env.create_branch("test_remote_extensions")
     endpoint = env.endpoints.create(
         "test_remote_extensions",
         config_lines=["log_min_messages=debug3"],
     )
 
     # mock remote_extensions spec
-    spec: Dict[str, Any] = {
+    spec: dict[str, Any] = {
+        "public_extensions": ["anon"],
+        "custom_extensions": None,
         "library_index": {
             "anon": "anon",
         },
@@ -121,6 +131,17 @@ def test_remote_extensions(
 
     httpserver.check()
 
+    # Check that we properly recorded downloads in the metrics
+    client = endpoint.http_client()
+    raw_metrics = client.metrics()
+    metrics = parse_metrics(raw_metrics)
+    remote_ext_requests = metrics.query_all(
+        "compute_ctl_remote_ext_requests_total",
+    )
+    assert len(remote_ext_requests) == 1
+    for sample in remote_ext_requests:
+        assert sample.value == 1
+
 
 # TODO
 # 1. Test downloading remote library.
@@ -130,7 +151,7 @@ def test_remote_extensions(
 #
 # 3.Test that extension is downloaded after endpoint restart,
 # when the library is used in the query.
-# Run the test with mutliple simultaneous connections to an endpoint.
+# Run the test with multiple simultaneous connections to an endpoint.
 # to ensure that the extension is downloaded only once.
 #
 # 4. Test that private extensions are only downloaded when they are present in the spec.

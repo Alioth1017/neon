@@ -12,7 +12,7 @@
 //!
 //! The endpoint is managed by the `compute_ctl` binary. When an endpoint is
 //! started, we launch `compute_ctl` It synchronizes the safekeepers, downloads
-//! the basebackup from the pageserver to initialize the the data directory, and
+//! the basebackup from the pageserver to initialize the data directory, and
 //! finally launches the PostgreSQL process. It watches the PostgreSQL process
 //! until it exits.
 //!
@@ -37,24 +37,37 @@
 //! ```
 //!
 use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use compute_api::requests::ConfigurationRequest;
+use compute_api::responses::ComputeCtlConfig;
+use compute_api::spec::Database;
+use compute_api::spec::PgIdent;
 use compute_api::spec::RemoteExtSpec;
+use compute_api::spec::Role;
+use nix::sys::signal::kill;
+use nix::sys::signal::Signal;
+use pageserver_api::shard::ShardStripeSize;
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
+use url::Host;
 use utils::id::{NodeId, TenantId, TimelineId};
 
 use crate::local_env::LocalEnv;
-use crate::pageserver::PageServerNode;
 use crate::postgresql_conf::PostgresConf;
+use crate::storage_controller::StorageController;
 
-use compute_api::responses::{ComputeState, ComputeStatus};
-use compute_api::spec::{Cluster, ComputeMode, ComputeSpec};
+use compute_api::responses::{ComputeStatus, ComputeStatusResponse};
+use compute_api::spec::{Cluster, ComputeFeature, ComputeMode, ComputeSpec};
 
 // contents of a endpoint.json file
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
@@ -64,10 +77,12 @@ pub struct EndpointConf {
     timeline_id: TimelineId,
     mode: ComputeMode,
     pg_port: u16,
-    http_port: u16,
+    external_http_port: u16,
+    internal_http_port: u16,
     pg_version: u32,
     skip_pg_catalog_updates: bool,
-    pageserver_id: NodeId,
+    drop_subscriptions_before_start: bool,
+    features: Vec<ComputeFeature>,
 }
 
 //
@@ -89,7 +104,21 @@ impl ComputeControlPlane {
         for endpoint_dir in std::fs::read_dir(env.endpoints_path())
             .with_context(|| format!("failed to list {}", env.endpoints_path().display()))?
         {
-            let ep = Endpoint::from_dir_entry(endpoint_dir?, &env)?;
+            let ep_res = Endpoint::from_dir_entry(endpoint_dir?, &env);
+            let ep = match ep_res {
+                Ok(ep) => ep,
+                Err(e) => match e.downcast::<std::io::Error>() {
+                    Ok(e) => {
+                        // A parallel task could delete an endpoint while we have just scanned the directory
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            continue;
+                        } else {
+                            Err(e)?
+                        }
+                    }
+                    Err(e) => Err(e)?,
+                },
+            };
             endpoints.insert(ep.endpoint_id.clone(), Arc::new(ep));
         }
 
@@ -104,7 +133,7 @@ impl ComputeControlPlane {
         1 + self
             .endpoints
             .values()
-            .map(|ep| std::cmp::max(ep.pg_address.port(), ep.http_address.port()))
+            .map(|ep| std::cmp::max(ep.pg_address.port(), ep.external_http_address.port()))
             .max()
             .unwrap_or(self.base_port)
     }
@@ -116,22 +145,28 @@ impl ComputeControlPlane {
         tenant_id: TenantId,
         timeline_id: TimelineId,
         pg_port: Option<u16>,
-        http_port: Option<u16>,
+        external_http_port: Option<u16>,
+        internal_http_port: Option<u16>,
         pg_version: u32,
         mode: ComputeMode,
-        pageserver_id: NodeId,
+        skip_pg_catalog_updates: bool,
+        drop_subscriptions_before_start: bool,
     ) -> Result<Arc<Endpoint>> {
         let pg_port = pg_port.unwrap_or_else(|| self.get_port());
-        let http_port = http_port.unwrap_or_else(|| self.get_port() + 1);
-        let pageserver =
-            PageServerNode::from_env(&self.env, self.env.get_pageserver_conf(pageserver_id)?);
-
+        let external_http_port = external_http_port.unwrap_or_else(|| self.get_port() + 1);
+        let internal_http_port = internal_http_port.unwrap_or_else(|| external_http_port + 1);
         let ep = Arc::new(Endpoint {
             endpoint_id: endpoint_id.to_owned(),
-            pg_address: SocketAddr::new("127.0.0.1".parse().unwrap(), pg_port),
-            http_address: SocketAddr::new("127.0.0.1".parse().unwrap(), http_port),
+            pg_address: SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), pg_port),
+            external_http_address: SocketAddr::new(
+                IpAddr::from(Ipv4Addr::UNSPECIFIED),
+                external_http_port,
+            ),
+            internal_http_address: SocketAddr::new(
+                IpAddr::from(Ipv4Addr::LOCALHOST),
+                internal_http_port,
+            ),
             env: self.env.clone(),
-            pageserver,
             timeline_id,
             mode,
             tenant_id,
@@ -142,7 +177,9 @@ impl ComputeControlPlane {
             // before and after start are the same. So, skip catalog updates,
             // with this we basically test a case of waking up an idle compute, where
             // we also skip catalog updates in the cloud.
-            skip_pg_catalog_updates: true,
+            skip_pg_catalog_updates,
+            drop_subscriptions_before_start,
+            features: vec![],
         });
 
         ep.create_endpoint_dir()?;
@@ -153,11 +190,13 @@ impl ComputeControlPlane {
                 tenant_id,
                 timeline_id,
                 mode,
-                http_port,
+                external_http_port,
+                internal_http_port,
                 pg_port,
                 pg_version,
-                skip_pg_catalog_updates: true,
-                pageserver_id,
+                skip_pg_catalog_updates,
+                drop_subscriptions_before_start,
+                features: vec![],
             })?,
         )?;
         std::fs::write(
@@ -185,7 +224,7 @@ impl ComputeControlPlane {
                 v.tenant_id == tenant_id
                     && v.timeline_id == timeline_id
                     && v.mode == mode
-                    && v.status() != "stopped"
+                    && v.status() != EndpointStatus::Stopped
             });
 
             if let Some((key, _)) = duplicates.next() {
@@ -206,9 +245,10 @@ pub struct Endpoint {
     pub timeline_id: TimelineId,
     pub mode: ComputeMode,
 
-    // port and address of the Postgres server and `compute_ctl`'s HTTP API
+    // port and address of the Postgres server and `compute_ctl`'s HTTP APIs
     pub pg_address: SocketAddr,
-    pub http_address: SocketAddr,
+    pub external_http_address: SocketAddr,
+    pub internal_http_address: SocketAddr,
 
     // postgres major version in the format: 14, 15, etc.
     pg_version: u32,
@@ -216,10 +256,33 @@ pub struct Endpoint {
     // These are not part of the endpoint as such, but the environment
     // the endpoint runs in.
     pub env: LocalEnv,
-    pageserver: PageServerNode,
 
     // Optimizations
     skip_pg_catalog_updates: bool,
+
+    drop_subscriptions_before_start: bool,
+    // Feature flags
+    features: Vec<ComputeFeature>,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum EndpointStatus {
+    Running,
+    Stopped,
+    Crashed,
+    RunningNoPidfile,
+}
+
+impl std::fmt::Display for EndpointStatus {
+    fn fmt(&self, writer: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let s = match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Crashed => "crashed",
+            Self::RunningNoPidfile => "running, no pidfile",
+        };
+        write!(writer, "{}", s)
+    }
 }
 
 impl Endpoint {
@@ -239,20 +302,25 @@ impl Endpoint {
         let conf: EndpointConf =
             serde_json::from_slice(&std::fs::read(entry.path().join("endpoint.json"))?)?;
 
-        let pageserver =
-            PageServerNode::from_env(env, env.get_pageserver_conf(conf.pageserver_id)?);
-
         Ok(Endpoint {
-            pg_address: SocketAddr::new("127.0.0.1".parse().unwrap(), conf.pg_port),
-            http_address: SocketAddr::new("127.0.0.1".parse().unwrap(), conf.http_port),
+            pg_address: SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), conf.pg_port),
+            external_http_address: SocketAddr::new(
+                IpAddr::from(Ipv4Addr::UNSPECIFIED),
+                conf.external_http_port,
+            ),
+            internal_http_address: SocketAddr::new(
+                IpAddr::from(Ipv4Addr::LOCALHOST),
+                conf.internal_http_port,
+            ),
             endpoint_id,
             env: env.clone(),
-            pageserver,
             timeline_id: conf.timeline_id,
             mode: conf.mode,
             tenant_id: conf.tenant_id,
             pg_version: conf.pg_version,
             skip_pg_catalog_updates: conf.skip_pg_catalog_updates,
+            drop_subscriptions_before_start: conf.drop_subscriptions_before_start,
+            features: conf.features,
         })
     }
 
@@ -272,7 +340,15 @@ impl Endpoint {
         conf.append("wal_log_hints", "off");
         conf.append("max_replication_slots", "10");
         conf.append("hot_standby", "on");
+        // Set to 1MB to both exercise getPage requests/LFC, and still have enough room for
+        // Postgres to operate. Everything smaller might be not enough for Postgres under load,
+        // and can cause errors like 'no unpinned buffers available', see
+        // <https://github.com/neondatabase/neon/issues/9956>
         conf.append("shared_buffers", "1MB");
+        // Postgres defaults to effective_io_concurrency=1, which does not exercise the pageserver's
+        // batching logic.  Set this to 2 so that we exercise the code a bit without letting
+        // individual tests do a lot of concurrent work on underpowered test machines
+        conf.append("effective_io_concurrency", "2");
         conf.append("fsync", "off");
         conf.append("max_connections", "100");
         conf.append("wal_level", "logical");
@@ -382,16 +458,16 @@ impl Endpoint {
         self.endpoint_path().join("pgdata")
     }
 
-    pub fn status(&self) -> &str {
+    pub fn status(&self) -> EndpointStatus {
         let timeout = Duration::from_millis(300);
         let has_pidfile = self.pgdata().join("postmaster.pid").exists();
         let can_connect = TcpStream::connect_timeout(&self.pg_address, timeout).is_ok();
 
         match (has_pidfile, can_connect) {
-            (true, true) => "running",
-            (false, false) => "stopped",
-            (true, false) => "crashed",
-            (false, true) => "running, no pidfile",
+            (true, true) => EndpointStatus::Running,
+            (false, false) => EndpointStatus::Stopped,
+            (true, false) => EndpointStatus::Crashed,
+            (false, true) => EndpointStatus::RunningNoPidfile,
         }
     }
 
@@ -439,11 +515,14 @@ impl Endpoint {
         Ok(())
     }
 
-    fn wait_for_compute_ctl_to_exit(&self) -> Result<()> {
-        // TODO use background_process::stop_process instead
+    fn wait_for_compute_ctl_to_exit(&self, send_sigterm: bool) -> Result<()> {
+        // TODO use background_process::stop_process instead: https://github.com/neondatabase/neon/pull/6482
         let pidfile_path = self.endpoint_path().join("compute_ctl.pid");
         let pid: u32 = std::fs::read_to_string(pidfile_path)?.parse()?;
         let pid = nix::unistd::Pid::from_raw(pid as i32);
+        if send_sigterm {
+            kill(pid, Signal::SIGTERM).ok();
+        }
         crate::background_process::wait_until_stopped("compute_ctl", pid)?;
         Ok(())
     }
@@ -464,13 +543,41 @@ impl Endpoint {
         }
     }
 
+    fn build_pageserver_connstr(pageservers: &[(Host, u16)]) -> String {
+        pageservers
+            .iter()
+            .map(|(host, port)| format!("postgresql://no_user@{host}:{port}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Map safekeepers ids to the actual connection strings.
+    fn build_safekeepers_connstrs(&self, sk_ids: Vec<NodeId>) -> Result<Vec<String>> {
+        let mut safekeeper_connstrings = Vec::new();
+        if self.mode == ComputeMode::Primary {
+            for sk_id in sk_ids {
+                let sk = self
+                    .env
+                    .safekeepers
+                    .iter()
+                    .find(|node| node.id == sk_id)
+                    .ok_or_else(|| anyhow!("safekeeper {sk_id} does not exist"))?;
+                safekeeper_connstrings.push(format!("127.0.0.1:{}", sk.get_compute_port()));
+            }
+        }
+        Ok(safekeeper_connstrings)
+    }
+
     pub async fn start(
         &self,
         auth_token: &Option<String>,
         safekeepers: Vec<NodeId>,
+        pageservers: Vec<(Host, u16)>,
         remote_ext_config: Option<&String>,
+        shard_stripe_size: usize,
+        create_test_user: bool,
     ) -> Result<()> {
-        if self.status() == "running" {
+        if self.status() == EndpointStatus::Running {
             anyhow::bail!("The endpoint is already running");
         }
 
@@ -482,25 +589,10 @@ impl Endpoint {
             std::fs::remove_dir_all(self.pgdata())?;
         }
 
-        let pageserver_connstring = {
-            let config = &self.pageserver.pg_connection_config;
-            let (host, port) = (config.host(), config.port());
+        let pageserver_connstring = Self::build_pageserver_connstr(&pageservers);
+        assert!(!pageserver_connstring.is_empty());
 
-            // NOTE: avoid spaces in connection string, because it is less error prone if we forward it somewhere.
-            format!("postgresql://no_user@{host}:{port}")
-        };
-        let mut safekeeper_connstrings = Vec::new();
-        if self.mode == ComputeMode::Primary {
-            for sk_id in safekeepers {
-                let sk = self
-                    .env
-                    .safekeepers
-                    .iter()
-                    .find(|node| node.id == sk_id)
-                    .ok_or_else(|| anyhow!("safekeeper {sk_id} does not exist"))?;
-                safekeeper_connstrings.push(format!("127.0.0.1:{}", sk.get_compute_port()));
-            }
-        }
+        let safekeeper_connstrings = self.build_safekeepers_connstrs(safekeepers)?;
 
         // check for file remote_extensions_spec.json
         // if it is present, read it and pass to compute_ctl
@@ -519,13 +611,34 @@ impl Endpoint {
             skip_pg_catalog_updates: self.skip_pg_catalog_updates,
             format_version: 1.0,
             operation_uuid: None,
-            features: vec![],
+            features: self.features.clone(),
+            swap_size_bytes: None,
+            disk_quota_bytes: None,
+            disable_lfc_resizing: None,
             cluster: Cluster {
                 cluster_id: None, // project ID: not used
                 name: None,       // project name: not used
                 state: None,
-                roles: vec![],
-                databases: vec![],
+                roles: if create_test_user {
+                    vec![Role {
+                        name: PgIdent::from_str("test").unwrap(),
+                        encrypted_password: None,
+                        options: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                databases: if create_test_user {
+                    vec![Database {
+                        name: PgIdent::from_str("neondb").unwrap(),
+                        owner: PgIdent::from_str("test").unwrap(),
+                        options: None,
+                        restrict_conn: false,
+                        invalid: false,
+                    }]
+                } else {
+                    Vec::new()
+                },
                 settings: None,
                 postgresql_conf: Some(postgresql_conf),
             },
@@ -537,6 +650,11 @@ impl Endpoint {
             safekeeper_connstrings,
             storage_auth_token: auth_token.clone(),
             remote_extensions,
+            pgbouncer_settings: None,
+            shard_stripe_size: Some(shard_stripe_size),
+            local_proxy_config: None,
+            reconfigure_concurrency: 1,
+            drop_subscriptions_before_start: self.drop_subscriptions_before_start,
         };
         let spec_path = self.endpoint_path().join("spec.json");
         std::fs::write(spec_path, serde_json::to_string_pretty(&spec)?)?;
@@ -548,35 +666,79 @@ impl Endpoint {
             .open(self.endpoint_path().join("compute.log"))?;
 
         // Launch compute_ctl
-        println!("Starting postgres node at '{}'", self.connstr());
+        let conn_str = self.connstr("cloud_admin", "postgres");
+        println!("Starting postgres node at '{}'", conn_str);
+        if create_test_user {
+            let conn_str = self.connstr("test", "neondb");
+            println!("Also at '{}'", conn_str);
+        }
         let mut cmd = Command::new(self.env.neon_distrib_dir.join("compute_ctl"));
-        cmd.args(["--http-port", &self.http_address.port().to_string()])
-            .args(["--pgdata", self.pgdata().to_str().unwrap()])
-            .args(["--connstr", &self.connstr()])
-            .args([
-                "--spec-path",
-                self.endpoint_path().join("spec.json").to_str().unwrap(),
-            ])
-            .args([
-                "--pgbin",
-                self.env
-                    .pg_bin_dir(self.pg_version)?
-                    .join("postgres")
-                    .to_str()
-                    .unwrap(),
-            ])
-            .stdin(std::process::Stdio::null())
-            .stderr(logfile.try_clone()?)
-            .stdout(logfile);
+        //cmd.args([
+        //    "--external-http-port",
+        //    &self.external_http_address.port().to_string(),
+        //])
+        //.args([
+        //    "--internal-http-port",
+        //    &self.internal_http_address.port().to_string(),
+        //])
+        cmd.args([
+            "--http-port",
+            &self.external_http_address.port().to_string(),
+        ])
+        .args(["--pgdata", self.pgdata().to_str().unwrap()])
+        .args(["--connstr", &conn_str])
+        .args([
+            "--spec-path",
+            self.endpoint_path().join("spec.json").to_str().unwrap(),
+        ])
+        .args([
+            "--pgbin",
+            self.env
+                .pg_bin_dir(self.pg_version)?
+                .join("postgres")
+                .to_str()
+                .unwrap(),
+        ])
+        // TODO: It would be nice if we generated compute IDs with the same
+        // algorithm as the real control plane.
+        //
+        // TODO: Add this back when
+        // https://github.com/neondatabase/neon/pull/10747 is merged.
+        //
+        //.args([
+        //    "--compute-id",
+        //    &format!(
+        //        "compute-{}",
+        //        SystemTime::now()
+        //            .duration_since(UNIX_EPOCH)
+        //            .unwrap()
+        //            .as_secs()
+        //    ),
+        //])
+        .stdin(std::process::Stdio::null())
+        .stderr(logfile.try_clone()?)
+        .stdout(logfile);
 
         if let Some(remote_ext_config) = remote_ext_config {
             cmd.args(["--remote-ext-config", remote_ext_config]);
         }
 
         let child = cmd.spawn()?;
+        // set up a scopeguard to kill & wait for the child in case we panic or bail below
+        let child = scopeguard::guard(child, |mut child| {
+            println!("SIGKILL & wait the started process");
+            (|| {
+                // TODO: use another signal that can be caught by the child so it can clean up any children it spawned
+                child.kill().context("SIGKILL child")?;
+                child.wait().context("wait() for child process")?;
+                anyhow::Ok(())
+            })()
+            .with_context(|| format!("scopeguard kill&wait child {child:?}"))
+            .unwrap();
+        });
 
         // Write down the pid so we can wait for it when we want to stop
-        // TODO use background_process::start_process instead
+        // TODO use background_process::start_process instead: https://github.com/neondatabase/neon/pull/6482
         let pid = child.id();
         let pidfile_path = self.endpoint_path().join("compute_ctl.pid");
         std::fs::write(pidfile_path, pid.to_string())?;
@@ -584,7 +746,7 @@ impl Endpoint {
         // Wait for it to start
         let mut attempt = 0;
         const ATTEMPT_INTERVAL: Duration = Duration::from_millis(100);
-        const MAX_ATTEMPTS: u32 = 10 * 30; // Wait up to 30 s
+        const MAX_ATTEMPTS: u32 = 10 * 90; // Wait up to 1.5 min
         loop {
             attempt += 1;
             match self.get_status().await {
@@ -611,7 +773,9 @@ impl Endpoint {
                         }
                         ComputeStatus::Empty
                         | ComputeStatus::ConfigurationPending
-                        | ComputeStatus::Configuration => {
+                        | ComputeStatus::Configuration
+                        | ComputeStatus::TerminationPending
+                        | ComputeStatus::Terminated => {
                             bail!("unexpected compute status: {:?}", state.status)
                         }
                     }
@@ -622,14 +786,17 @@ impl Endpoint {
                     }
                 }
             }
-            std::thread::sleep(ATTEMPT_INTERVAL);
+            tokio::time::sleep(ATTEMPT_INTERVAL).await;
         }
+
+        // disarm the scopeguard, let the child outlive this function (and neon_local invoction)
+        drop(scopeguard::ScopeGuard::into_inner(child));
 
         Ok(())
     }
 
     // Call the /status HTTP API
-    pub async fn get_status(&self) -> Result<ComputeState> {
+    pub async fn get_status(&self) -> Result<ComputeStatusResponse> {
         let client = reqwest::Client::new();
 
         let response = client
@@ -637,8 +804,8 @@ impl Endpoint {
                 reqwest::Method::GET,
                 format!(
                     "http://{}:{}/status",
-                    self.http_address.ip(),
-                    self.http_address.port()
+                    self.external_http_address.ip(),
+                    self.external_http_address.port()
                 ),
             )
             .send()
@@ -659,7 +826,12 @@ impl Endpoint {
         }
     }
 
-    pub async fn reconfigure(&self, pageserver_id: Option<NodeId>) -> Result<()> {
+    pub async fn reconfigure(
+        &self,
+        mut pageservers: Vec<(Host, u16)>,
+        stripe_size: Option<ShardStripeSize>,
+        safekeepers: Option<Vec<NodeId>>,
+    ) -> Result<()> {
         let mut spec: ComputeSpec = {
             let spec_path = self.endpoint_path().join("spec.json");
             let file = std::fs::File::open(spec_path)?;
@@ -669,36 +841,54 @@ impl Endpoint {
         let postgresql_conf = self.read_postgresql_conf()?;
         spec.cluster.postgresql_conf = Some(postgresql_conf);
 
-        if let Some(pageserver_id) = pageserver_id {
-            let endpoint_config_path = self.endpoint_path().join("endpoint.json");
-            let mut endpoint_conf: EndpointConf = {
-                let file = std::fs::File::open(&endpoint_config_path)?;
-                serde_json::from_reader(file)?
-            };
-            endpoint_conf.pageserver_id = pageserver_id;
-            std::fs::write(
-                endpoint_config_path,
-                serde_json::to_string_pretty(&endpoint_conf)?,
-            )?;
-
-            let pageserver =
-                PageServerNode::from_env(&self.env, self.env.get_pageserver_conf(pageserver_id)?);
-            let ps_http_conf = &pageserver.pg_connection_config;
-            let (host, port) = (ps_http_conf.host(), ps_http_conf.port());
-            spec.pageserver_connstring = Some(format!("postgresql://no_user@{host}:{port}"));
+        // If we weren't given explicit pageservers, query the storage controller
+        if pageservers.is_empty() {
+            let storage_controller = StorageController::from_env(&self.env);
+            let locate_result = storage_controller.tenant_locate(self.tenant_id).await?;
+            pageservers = locate_result
+                .shards
+                .into_iter()
+                .map(|shard| {
+                    (
+                        Host::parse(&shard.listen_pg_addr)
+                            .expect("Storage controller reported bad hostname"),
+                        shard.listen_pg_port,
+                    )
+                })
+                .collect::<Vec<_>>();
         }
 
-        let client = reqwest::Client::new();
+        let pageserver_connstr = Self::build_pageserver_connstr(&pageservers);
+        assert!(!pageserver_connstr.is_empty());
+        spec.pageserver_connstring = Some(pageserver_connstr);
+        if stripe_size.is_some() {
+            spec.shard_stripe_size = stripe_size.map(|s| s.0 as usize);
+        }
+
+        // If safekeepers are not specified, don't change them.
+        if let Some(safekeepers) = safekeepers {
+            let safekeeper_connstrings = self.build_safekeepers_connstrs(safekeepers)?;
+            spec.safekeeper_connstrings = safekeeper_connstrings;
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
         let response = client
             .post(format!(
                 "http://{}:{}/configure",
-                self.http_address.ip(),
-                self.http_address.port()
+                self.external_http_address.ip(),
+                self.external_http_address.port()
             ))
-            .body(format!(
-                "{{\"spec\":{}}}",
-                serde_json::to_string_pretty(&spec)?
-            ))
+            .header(CONTENT_TYPE.as_str(), "application/json")
+            .body(
+                serde_json::to_string(&ConfigurationRequest {
+                    spec,
+                    compute_ctl_config: ComputeCtlConfig::default(),
+                })
+                .unwrap(),
+            )
             .send()
             .await?;
 
@@ -715,27 +905,19 @@ impl Endpoint {
         }
     }
 
-    pub fn stop(&self, destroy: bool) -> Result<()> {
-        // If we are going to destroy data directory,
-        // use immediate shutdown mode, otherwise,
-        // shutdown gracefully to leave the data directory sane.
-        //
-        // Postgres is always started from scratch, so stop
-        // without destroy only used for testing and debugging.
-        //
-        self.pg_ctl(
-            if destroy {
-                &["-m", "immediate", "stop"]
-            } else {
-                &["stop"]
-            },
-            &None,
-        )?;
+    pub fn stop(&self, mode: &str, destroy: bool) -> Result<()> {
+        self.pg_ctl(&["-m", mode, "stop"], &None)?;
 
-        // Also wait for the compute_ctl process to die. It might have some cleanup
-        // work to do after postgres stops, like syncing safekeepers, etc.
+        // Also wait for the compute_ctl process to die. It might have some
+        // cleanup work to do after postgres stops, like syncing safekeepers,
+        // etc.
         //
-        self.wait_for_compute_ctl_to_exit()?;
+        // If destroying or stop mode is immediate, send it SIGTERM before
+        // waiting. Sometimes we do *not* want this cleanup: tests intentionally
+        // do stop when majority of safekeepers is down, so sync-safekeepers
+        // would hang otherwise. This could be a separate flag though.
+        let send_sigterm = destroy || mode == "immediate";
+        self.wait_for_compute_ctl_to_exit(send_sigterm)?;
         if destroy {
             println!(
                 "Destroying postgres data directory '{}'",
@@ -746,13 +928,13 @@ impl Endpoint {
         Ok(())
     }
 
-    pub fn connstr(&self) -> String {
+    pub fn connstr(&self, user: &str, db_name: &str) -> String {
         format!(
             "postgresql://{}@{}:{}/{}",
-            "cloud_admin",
+            user,
             self.pg_address.ip(),
             self.pg_address.port(),
-            "postgres"
+            db_name
         )
     }
 }

@@ -2,43 +2,68 @@ name: Create Release Branch
 
 on:
   schedule:
-    - cron: '0 6 * * 1'
+    # It should be kept in sync with if-condition in jobs
+    - cron: '0 6 * * THU' # Proxy release
+    - cron: '0 6 * * FRI' # Storage release
+    - cron: '0 7 * * FRI' # Compute release
   workflow_dispatch:
+    inputs:
+      create-storage-release-branch:
+        type: boolean
+        description: 'Create Storage release PR'
+        required: false
+      create-proxy-release-branch:
+        type: boolean
+        description: 'Create Proxy release PR'
+        required: false
+      create-compute-release-branch:
+        type: boolean
+        description: 'Create Compute release PR'
+        required: false
+
+# No permission for GITHUB_TOKEN by default; the **minimal required** set of permissions should be granted in each job.
+permissions: {}
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
 
 jobs:
-  create_release_branch:
-    runs-on: [ ubuntu-latest ]
+  create-storage-release-branch:
+    if: ${{ github.event.schedule == '0 6 * * FRI' || inputs.create-storage-release-branch }}
 
     permissions:
-      contents: write # for `git push`
+      contents: write
 
-    steps:
-    - name: Check out code
-      uses: actions/checkout@v4
-      with:
-        ref: main
+    uses: ./.github/workflows/_create-release-pr.yml
+    with:
+      component-name: 'Storage'
+      release-branch: 'release'
+    secrets:
+      ci-access-token: ${{ secrets.CI_ACCESS_TOKEN }}
 
-    - name: Get current date
-      id: date
-      run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+  create-proxy-release-branch:
+    if: ${{ github.event.schedule == '0 6 * * THU' || inputs.create-proxy-release-branch }}
 
-    - name: Create release branch
-      run: git checkout -b releases/${{ steps.date.outputs.date }}
+    permissions:
+      contents: write
 
-    - name: Push new branch
-      run: git push origin releases/${{ steps.date.outputs.date }}
+    uses: ./.github/workflows/_create-release-pr.yml
+    with:
+      component-name: 'Proxy'
+      release-branch: 'release-proxy'
+    secrets:
+      ci-access-token: ${{ secrets.CI_ACCESS_TOKEN }}
 
-    - name: Create pull request into release
-      env:
-        GH_TOKEN: ${{ secrets.CI_ACCESS_TOKEN }}
-      run: |
-        cat << EOF > body.md
-          ## Release ${{ steps.date.outputs.date }}
+  create-compute-release-branch:
+    if: ${{ github.event.schedule == '0 7 * * FRI' || inputs.create-compute-release-branch }}
 
-          **Please merge this PR using 'Create a merge commit'!**
-        EOF
+    permissions:
+      contents: write
 
-        gh pr create --title "Release ${{ steps.date.outputs.date }}" \
-                     --body-file "body.md" \
-                     --head "releases/${{ steps.date.outputs.date }}" \
-                     --base "release"
+    uses: ./.github/workflows/_create-release-pr.yml
+    with:
+      component-name: 'Compute'
+      release-branch: 'release-compute'
+    secrets:
+      ci-access-token: ${{ secrets.CI_ACCESS_TOKEN }}

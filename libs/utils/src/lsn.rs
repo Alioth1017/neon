@@ -1,6 +1,5 @@
 #![warn(missing_docs)]
 
-use camino::Utf8Path;
 use serde::{de::Visitor, Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Add, AddAssign};
@@ -13,7 +12,7 @@ use crate::seqwait::MonotonicCounter;
 pub const XLOG_BLCKSZ: u32 = 8192;
 
 /// A Postgres LSN (Log Sequence Number), also known as an XLogRecPtr
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+#[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct Lsn(pub u64);
 
 impl Serialize for Lsn {
@@ -38,7 +37,7 @@ impl<'de> Deserialize<'de> for Lsn {
             is_human_readable_deserializer: bool,
         }
 
-        impl<'de> Visitor<'de> for LsnVisitor {
+        impl Visitor<'_> for LsnVisitor {
             type Value = Lsn;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -139,18 +138,15 @@ impl Lsn {
         self.0.checked_sub(other).map(Lsn)
     }
 
+    /// Subtract a number, saturating at numeric bounds instead of overflowing.
+    pub fn saturating_sub<T: Into<u64>>(self, other: T) -> Lsn {
+        Lsn(self.0.saturating_sub(other.into()))
+    }
+
     /// Subtract a number, returning the difference as i128 to avoid overflow.
     pub fn widening_sub<T: Into<u64>>(self, other: T) -> i128 {
         let other: u64 = other.into();
         i128::from(self.0) - i128::from(other)
-    }
-
-    /// Parse an LSN from a filename in the form `0000000000000000`
-    pub fn from_filename<F>(filename: F) -> Result<Self, LsnParseError>
-    where
-        F: AsRef<Utf8Path>,
-    {
-        Lsn::from_hex(filename.as_ref().as_str())
     }
 
     /// Parse an LSN from a string in the form `0000000000000000`
@@ -264,7 +260,7 @@ impl FromStr for Lsn {
         {
             let left_num = u32::from_str_radix(left, 16).map_err(|_| LsnParseError)?;
             let right_num = u32::from_str_radix(right, 16).map_err(|_| LsnParseError)?;
-            Ok(Lsn((left_num as u64) << 32 | right_num as u64))
+            Ok(Lsn(((left_num as u64) << 32) | right_num as u64))
         } else {
             Err(LsnParseError)
         }
@@ -366,13 +362,55 @@ impl MonotonicCounter<Lsn> for RecordLsn {
     }
 }
 
+/// Implements  [`rand::distributions::uniform::UniformSampler`] so we can sample [`Lsn`]s.
+///
+/// This is used by the `pagebench` pageserver benchmarking tool.
+pub struct LsnSampler(<u64 as rand::distributions::uniform::SampleUniform>::Sampler);
+
+impl rand::distributions::uniform::SampleUniform for Lsn {
+    type Sampler = LsnSampler;
+}
+
+impl rand::distributions::uniform::UniformSampler for LsnSampler {
+    type X = Lsn;
+
+    fn new<B1, B2>(low: B1, high: B2) -> Self
+    where
+        B1: rand::distributions::uniform::SampleBorrow<Self::X> + Sized,
+        B2: rand::distributions::uniform::SampleBorrow<Self::X> + Sized,
+    {
+        Self(
+            <u64 as rand::distributions::uniform::SampleUniform>::Sampler::new(
+                low.borrow().0,
+                high.borrow().0,
+            ),
+        )
+    }
+
+    fn new_inclusive<B1, B2>(low: B1, high: B2) -> Self
+    where
+        B1: rand::distributions::uniform::SampleBorrow<Self::X> + Sized,
+        B2: rand::distributions::uniform::SampleBorrow<Self::X> + Sized,
+    {
+        Self(
+            <u64 as rand::distributions::uniform::SampleUniform>::Sampler::new_inclusive(
+                low.borrow().0,
+                high.borrow().0,
+            ),
+        )
+    }
+
+    fn sample<R: rand::prelude::Rng + ?Sized>(&self, rng: &mut R) -> Self::X {
+        Lsn(self.0.sample(rng))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::bin_ser::BeSer;
 
     use super::*;
 
-    use serde::ser::Serialize;
     use serde_assert::{Deserializer, Serializer, Token, Tokens};
 
     #[test]

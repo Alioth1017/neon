@@ -2,30 +2,24 @@
 //! Import data and WAL from a PostgreSQL data directory and WAL segments into
 //! a neon Timeline.
 //!
-use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
-use async_compression::tokio::bufread::ZstdDecoder;
-use async_compression::{tokio::write::ZstdEncoder, zstd::CParameter, Level};
 use bytes::Bytes;
 use camino::Utf8Path;
 use futures::StreamExt;
-use nix::NixPath;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use pageserver_api::key::rel_block_to_key;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_tar::Archive;
-use tokio_tar::Builder;
-use tokio_tar::HeaderMode;
 use tracing::*;
+use wal_decoder::models::InterpretedWalRecord;
 use walkdir::WalkDir;
 
 use crate::context::RequestContext;
+use crate::metrics::WAL_INGEST;
 use crate::pgdatadir_mapping::*;
-use crate::tenant::remote_timeline_client::INITDB_PATH;
 use crate::tenant::Timeline;
 use crate::walingest::WalIngest;
-use crate::walrecord::DecodedWALRecord;
 use pageserver_api::reltag::{RelTag, SlruKind};
 use postgres_ffi::pg_constants;
 use postgres_ffi::relfile_utils::*;
@@ -177,7 +171,10 @@ async fn import_rel(
         let r = reader.read_exact(&mut buf).await;
         match r {
             Ok(_) => {
-                modification.put_rel_page_image(rel, blknum, Bytes::copy_from_slice(&buf))?;
+                let key = rel_block_to_key(rel, blknum);
+                if modification.tline.get_shard_identity().is_key_local(&key) {
+                    modification.put_rel_page_image(rel, blknum, Bytes::copy_from_slice(&buf))?;
+                }
             }
 
             // TODO: UnexpectedEof is expected
@@ -281,6 +278,8 @@ async fn import_wal(
 
     let mut walingest = WalIngest::new(tline, startpoint, ctx).await?;
 
+    let shard = vec![*tline.get_shard_identity()];
+
     while last_lsn <= endpoint {
         // FIXME: assume postgresql tli 1 for now
         let filename = XLogFileName(1, segno, WAL_SEGMENT_SIZE);
@@ -312,13 +311,24 @@ async fn import_wal(
         waldecoder.feed_bytes(&buf);
 
         let mut nrecords = 0;
-        let mut modification = tline.begin_modification(endpoint);
-        let mut decoded = DecodedWALRecord::default();
+        let mut modification = tline.begin_modification(last_lsn);
         while last_lsn <= endpoint {
             if let Some((lsn, recdata)) = waldecoder.poll_decode()? {
+                let interpreted = InterpretedWalRecord::from_bytes_filtered(
+                    recdata,
+                    &shard,
+                    lsn,
+                    tline.pg_version,
+                )?
+                .remove(tline.get_shard_identity())
+                .unwrap();
+
                 walingest
-                    .ingest_record(recdata, lsn, &mut modification, &mut decoded, ctx)
+                    .ingest_record(interpreted, &mut modification, ctx)
                     .await?;
+                WAL_INGEST.records_committed.inc();
+
+                modification.commit(ctx).await?;
                 last_lsn = lsn;
 
                 nrecords += 1;
@@ -405,6 +415,7 @@ pub async fn import_wal_from_tar(
     let mut offset = start_lsn.segment_offset(WAL_SEGMENT_SIZE);
     let mut last_lsn = start_lsn;
     let mut walingest = WalIngest::new(tline, start_lsn, ctx).await?;
+    let shard = vec![*tline.get_shard_identity()];
 
     // Ingest wal until end_lsn
     info!("importing wal until {}", end_lsn);
@@ -448,13 +459,22 @@ pub async fn import_wal_from_tar(
 
         waldecoder.feed_bytes(&bytes[offset..]);
 
-        let mut modification = tline.begin_modification(end_lsn);
-        let mut decoded = DecodedWALRecord::default();
+        let mut modification = tline.begin_modification(last_lsn);
         while last_lsn <= end_lsn {
             if let Some((lsn, recdata)) = waldecoder.poll_decode()? {
+                let interpreted = InterpretedWalRecord::from_bytes_filtered(
+                    recdata,
+                    &shard,
+                    lsn,
+                    tline.pg_version,
+                )?
+                .remove(tline.get_shard_identity())
+                .unwrap();
+
                 walingest
-                    .ingest_record(recdata, lsn, &mut modification, &mut decoded, ctx)
+                    .ingest_record(interpreted, &mut modification, ctx)
                     .await?;
+                modification.commit(ctx).await?;
                 last_lsn = lsn;
 
                 debug!("imported record at {} (end {})", lsn, end_lsn);
@@ -562,22 +582,30 @@ async fn import_file(
     } else if file_path.starts_with("pg_xact") {
         let slru = SlruKind::Clog;
 
-        import_slru(modification, slru, file_path, reader, len, ctx).await?;
-        debug!("imported clog slru");
+        if modification.tline.tenant_shard_id.is_shard_zero() {
+            import_slru(modification, slru, file_path, reader, len, ctx).await?;
+            debug!("imported clog slru");
+        }
     } else if file_path.starts_with("pg_multixact/offsets") {
         let slru = SlruKind::MultiXactOffsets;
 
-        import_slru(modification, slru, file_path, reader, len, ctx).await?;
-        debug!("imported multixact offsets slru");
+        if modification.tline.tenant_shard_id.is_shard_zero() {
+            import_slru(modification, slru, file_path, reader, len, ctx).await?;
+            debug!("imported multixact offsets slru");
+        }
     } else if file_path.starts_with("pg_multixact/members") {
         let slru = SlruKind::MultiXactMembers;
 
-        import_slru(modification, slru, file_path, reader, len, ctx).await?;
-        debug!("imported multixact members slru");
+        if modification.tline.tenant_shard_id.is_shard_zero() {
+            import_slru(modification, slru, file_path, reader, len, ctx).await?;
+            debug!("imported multixact members slru");
+        }
     } else if file_path.starts_with("pg_twophase") {
-        let xid = u32::from_str_radix(file_name.as_ref(), 16)?;
-
         let bytes = read_all_bytes(reader).await?;
+
+        // In PostgreSQL v17, this is a 64-bit FullTransactionid. In previous versions,
+        // it's a 32-bit TransactionId, which fits in u64 anyway.
+        let xid = u64::from_str_radix(file_name.as_ref(), 16)?;
         modification
             .put_twophase_file(xid, Bytes::copy_from_slice(&bytes[..]), ctx)
             .await?;
@@ -627,66 +655,4 @@ async fn read_all_bytes(reader: &mut (impl AsyncRead + Unpin)) -> Result<Bytes> 
     let mut buf: Vec<u8> = vec![];
     reader.read_to_end(&mut buf).await?;
     Ok(Bytes::from(buf))
-}
-
-pub async fn create_tar_zst(pgdata_path: &Utf8Path, tmp_path: &Utf8Path) -> Result<(File, u64)> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&tmp_path)
-        .await
-        .with_context(|| format!("tempfile creation {tmp_path}"))?;
-
-    let mut paths = Vec::new();
-    for entry in WalkDir::new(pgdata_path) {
-        let entry = entry?;
-        let metadata = entry.metadata().expect("error getting dir entry metadata");
-        // Also allow directories so that we also get empty directories
-        if !(metadata.is_file() || metadata.is_dir()) {
-            continue;
-        }
-        let path = entry.into_path();
-        paths.push(path);
-    }
-    // Do a sort to get a more consistent listing
-    paths.sort_unstable();
-    let zstd = ZstdEncoder::with_quality_and_params(
-        file,
-        Level::Default,
-        &[CParameter::enable_long_distance_matching(true)],
-    );
-    let mut builder = Builder::new(zstd);
-    // Use reproducible header mode
-    builder.mode(HeaderMode::Deterministic);
-    for path in paths {
-        let rel_path = path.strip_prefix(pgdata_path)?;
-        if rel_path.is_empty() {
-            // The top directory should not be compressed,
-            // the tar crate doesn't like that
-            continue;
-        }
-        builder.append_path_with_name(&path, rel_path).await?;
-    }
-    let mut zstd = builder.into_inner().await?;
-    zstd.shutdown().await?;
-    let mut compressed = zstd.into_inner();
-    let compressed_len = compressed.metadata().await?.len();
-    const INITDB_TAR_ZST_WARN_LIMIT: u64 = 2 * 1024 * 1024;
-    if compressed_len > INITDB_TAR_ZST_WARN_LIMIT {
-        warn!("compressed {INITDB_PATH} size of {compressed_len} is above limit {INITDB_TAR_ZST_WARN_LIMIT}.");
-    }
-    compressed.seek(SeekFrom::Start(0)).await?;
-    Ok((compressed, compressed_len))
-}
-
-pub async fn extract_tar_zst(
-    pgdata_path: &Utf8Path,
-    tar_zst: impl AsyncBufRead + Unpin,
-) -> Result<()> {
-    let tar = Box::pin(ZstdDecoder::new(tar_zst));
-    let mut archive = Archive::new(tar);
-    archive.unpack(pgdata_path).await?;
-    Ok(())
 }

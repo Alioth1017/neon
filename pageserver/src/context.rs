@@ -1,7 +1,9 @@
-//! This module defines `RequestContext`, a structure that we use throughout
-//! the pageserver to propagate high-level context from places
-//! that _originate_ activity down to the shared code paths at the
-//! heart of the pageserver. It's inspired by Golang's `context.Context`.
+//! Defines [`RequestContext`].
+//!
+//! It is a structure that we use throughout the pageserver to propagate
+//! high-level context from places that _originate_ activity down to the
+//! shared code paths at the heart of the pageserver. It's inspired by
+//! Golang's `context.Context`.
 //!
 //! For example, in `Timeline::get(page_nr, lsn)` we need to answer the following questions:
 //! 1. What high-level activity ([`TaskKind`]) needs this page?
@@ -59,6 +61,7 @@
 //! 1. It should be easy to forward the context to callees.
 //! 2. To propagate more data from high-level to low-level code, the functions in
 //!    the middle should not need to be modified.
+//!
 //! The solution is to have a container structure ([`RequestContext`]) that
 //! carries the information. Functions that don't care about what's in it
 //! pass it along to callees.
@@ -89,7 +92,7 @@
 use crate::task_mgr::TaskKind;
 
 // The main structure of this module, see module-level comment.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RequestContext {
     task_kind: TaskKind,
     download_behavior: DownloadBehavior,
@@ -101,8 +104,10 @@ pub struct RequestContext {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, enum_map::Enum, strum_macros::IntoStaticStr)]
 pub enum PageContentKind {
     Unknown,
+    DeltaLayerSummary,
     DeltaLayerBtreeNode,
     DeltaLayerValue,
+    ImageLayerSummary,
     ImageLayerBtreeNode,
     ImageLayerValue,
     InMemoryLayer,

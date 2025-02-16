@@ -6,24 +6,22 @@
 //! modifications in tests.
 //!
 
-use std::sync::Arc;
-
 use anyhow::Context;
-use bytes::Bytes;
 use postgres_backend::QueryError;
+use safekeeper_api::membership::Configuration;
+use safekeeper_api::{ServerInfo, Term};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::*;
-use utils::id::TenantTimelineId;
 
 use crate::handler::SafekeeperPostgresHandler;
-use crate::safekeeper::{AcceptorProposerMessage, AppendResponse, ServerInfo};
+use crate::safekeeper::{AcceptorProposerMessage, AppendResponse};
 use crate::safekeeper::{
     AppendRequest, AppendRequestHeader, ProposerAcceptorMessage, ProposerElected,
 };
-use crate::safekeeper::{SafeKeeperState, Term, TermHistory, TermLsn};
-use crate::timeline::Timeline;
-use crate::GlobalTimelines;
+use crate::safekeeper::{TermHistory, TermLsn};
+use crate::state::TimelinePersistentState;
+use crate::timeline::WalResidentTimeline;
 use postgres_backend::PostgresBackend;
 use postgres_ffi::encode_logical_message;
 use postgres_ffi::WAL_SEGMENT_SIZE;
@@ -56,7 +54,7 @@ pub struct AppendLogicalMessage {
 #[derive(Debug, Serialize)]
 struct AppendResult {
     // safekeeper state after append
-    state: SafeKeeperState,
+    state: TimelinePersistentState,
     // info about new record in the WAL
     inserted_wal: InsertedWAL,
 }
@@ -72,7 +70,7 @@ pub async fn handle_json_ctrl<IO: AsyncRead + AsyncWrite + Unpin>(
     info!("JSON_CTRL request: {append_request:?}");
 
     // need to init safekeeper state before AppendRequest
-    let tli = prepare_safekeeper(spg.ttid, append_request.pg_version).await?;
+    let tli = prepare_safekeeper(spg, append_request.pg_version).await?;
 
     // if send_proposer_elected is true, we need to update local history
     if append_request.send_proposer_elected {
@@ -101,23 +99,32 @@ pub async fn handle_json_ctrl<IO: AsyncRead + AsyncWrite + Unpin>(
 /// Prepare safekeeper to process append requests without crashes,
 /// by sending ProposerGreeting with default server.wal_seg_size.
 async fn prepare_safekeeper(
-    ttid: TenantTimelineId,
+    spg: &SafekeeperPostgresHandler,
     pg_version: u32,
-) -> anyhow::Result<Arc<Timeline>> {
-    GlobalTimelines::create(
-        ttid,
-        ServerInfo {
-            pg_version,
-            wal_seg_size: WAL_SEGMENT_SIZE as u32,
-            system_id: 0,
-        },
-        Lsn::INVALID,
-        Lsn::INVALID,
-    )
-    .await
+) -> anyhow::Result<WalResidentTimeline> {
+    let tli = spg
+        .global_timelines
+        .create(
+            spg.ttid,
+            Configuration::empty(),
+            ServerInfo {
+                pg_version,
+                wal_seg_size: WAL_SEGMENT_SIZE as u32,
+                system_id: 0,
+            },
+            Lsn::INVALID,
+            Lsn::INVALID,
+        )
+        .await?;
+
+    tli.wal_residence_guard().await
 }
 
-async fn send_proposer_elected(tli: &Arc<Timeline>, term: Term, lsn: Lsn) -> anyhow::Result<()> {
+async fn send_proposer_elected(
+    tli: &WalResidentTimeline,
+    term: Term,
+    lsn: Lsn,
+) -> anyhow::Result<()> {
     // add new term to existing history
     let history = tli.get_state().await.1.acceptor_state.term_history;
     let history = history.up_to(lsn.checked_sub(1u64).unwrap());
@@ -146,7 +153,7 @@ pub struct InsertedWAL {
 /// Extend local WAL with new LogicalMessage record. To do that,
 /// create AppendRequest with new WAL and pass it to safekeeper.
 pub async fn append_logical_message(
-    tli: &Arc<Timeline>,
+    tli: &WalResidentTimeline,
     msg: &AppendLogicalMessage,
 ) -> anyhow::Result<InsertedWAL> {
     let wal_data = encode_logical_message(&msg.lm_prefix, &msg.lm_message);
@@ -164,14 +171,14 @@ pub async fn append_logical_message(
     let append_request = ProposerAcceptorMessage::AppendRequest(AppendRequest {
         h: AppendRequestHeader {
             term: msg.term,
-            epoch_start_lsn: begin_lsn,
+            term_start_lsn: begin_lsn,
             begin_lsn,
             end_lsn,
             commit_lsn,
             truncate_lsn: msg.truncate_lsn,
             proposer_uuid: [0u8; 16],
         },
-        wal_data: Bytes::from(wal_data),
+        wal_data,
     });
 
     let response = tli.process_msg(&append_request).await?;

@@ -20,7 +20,7 @@ ln -s ../../pre-commit.py .git/hooks/pre-commit
 
 This will run following checks on staged files before each commit:
 - `rustfmt`
-- checks for python files, see [obligatory checks](/docs/sourcetree.md#obligatory-checks).
+- checks for Python files, see [obligatory checks](/docs/sourcetree.md#obligatory-checks).
 
 There is also a separate script `./run_clippy.sh` that runs `cargo clippy` on the whole project
 and `./scripts/reformat` that runs all formatting tools to ensure the project is up to date.
@@ -54,6 +54,9 @@ _An instruction for maintainers_
 - If and only if it looks **safe** (i.e. it doesn't contain any malicious code which could expose secrets or harm the CI), then:
     - Press the "Approve and run" button in GitHub UI
     - Add the `approved-for-ci-run` label to the PR
+    - Currently draft PR will skip e2e test (only for internal contributors). After turning the PR 'Ready to Review' CI will trigger e2e test
+      - Add `run-e2e-tests-in-draft` label to run e2e test in draft PR (override above behaviour)
+      - The `approved-for-ci-run` workflow will add `run-e2e-tests-in-draft` automatically to run e2e test for external contributors
 
 Repeat all steps after any change to the PR.
 - When the changes are ready to get merged — merge the original PR (not the internal one)
@@ -70,3 +73,12 @@ We're using the following approach to make it work:
 - The label gets removed automatically, so to run CI again with new changes, the label should be added again (after the review)
 
 For details see [`approved-for-ci-run.yml`](.github/workflows/approved-for-ci-run.yml)
+
+## How do I make build-tools image "pinned"
+
+It's possible to update the `pinned` tag of the `build-tools` image using the `pin-build-tools-image.yml` workflow.
+
+```bash
+gh workflow -R neondatabase/neon run pin-build-tools-image.yml \
+            -f from-tag=cc98d9b00d670f182c507ae3783342bd7e64c31e
+```
